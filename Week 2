@@ -1,0 +1,86 @@
+
+ //Example ATmega2560 Project
+//File: ATmega2560Project.c
+//An example file for second year mechatronics project
+
+//include this .c file's header file
+#include "Controller.h"
+
+
+//static function prototypes, functions only called in this file
+
+int main(void)
+{
+  DDRA = 0xFF;    //put PORTA into output mode
+  PORTA = 0; 
+
+  DDRB = 0;    //for output of LEDs
+  PORTB |= (1<<PB0);
+
+  adc_init(); //initialse ADC
+  _delay_ms(20); //it's a good idea to wait a bit after your init section
+
+  uint8_t direction = 0;  // 0=X (ADC0), 1=Y (ADC1)
+
+  while(1)
+  {
+    if (!(PINB & (1<<PB0)))  //if button is pressed
+    {
+      direction = !direction;
+    }
+
+    uint16_t adcVal;
+    if (direction == 0) 
+    {
+      adcVal = adc_read(0);  //X-axis
+    } 
+    else 
+    {
+      adcVal = adc_read(1);  //Y-axis
+    }
+
+    uint8_t ledVal = adcVal / 4;  //dividing so it fits in 8 bit led pin mapping
+
+    PORTA = ledVal;
+
+  }
+
+  return(1);
+}//end main 
+
+
+
+
+
+
+#include "Controller.h"
+
+int main(void) {
+    DDRA = 0xFF;  // PORTA as output for LEDs
+    PORTA = 0x00; // Start with LEDs off
+    
+    adc_init();   // Initialize ADC
+    _delay_ms(20);  // Delay after init
+    
+    // Empirical min/max ADC for your photoresistor (adjust after measuring)
+    uint16_t min_adc = 200;  // Dark value (higher resistance, lower voltage)
+    uint16_t max_adc = 800;  // Bright value (lower resistance, higher voltage)
+    
+    while (1) {
+        uint16_t adc_value = adc_read(2);  // Read ADC2 for photoresistor
+        
+        // Clamp and scale to 0-8 levels
+        if (adc_value < min_adc) adc_value = min_adc;
+        if (adc_value > max_adc) adc_value = max_adc;
+        uint8_t levels = ((adc_value - min_adc) * 8) / (max_adc - min_adc);
+        
+        // Bar graph: Light up first 'levels' LEDs (0x00 to 0xFF)
+        uint8_t bar_graph = (1 << levels) - 1;  // e.g., 3 levels = 0b00000111
+        
+        PORTA = bar_graph;
+        
+        _delay_ms(100);  // Update rate
+    }
+    
+    return 0;
+}
