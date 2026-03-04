@@ -1,0 +1,51 @@
+
+//Example ATmega2560 Project
+//File: ATmega2560Project.c
+//An example file for second year mechatronics project
+
+//include this .c file's header file
+#include "Controller.h"
+
+volatile bool buttonPressed = 0;
+
+int main(void)
+{
+  milliseconds_init();
+  serial0_init();
+  adc_init();
+  _delay_ms(20);
+
+  cli();
+  DDRD &= ~(1<<PD2);
+  PORTD |= (1<<PD2);  
+  EICRA |=  (1<<ISC21);
+  EICRA &= ~(1<<ISC20); // INT0 falling edge trigger
+  EIMSK |=  (1<<INT2);  // INT0 enable
+  sei();
+
+  char serialString[60] = {}; // 60 character long empty array
+
+  adc_init(); //initialse ADC
+  _delay_ms(20); //it's a good idea to wait a bit after your init section
+
+  while(1)
+  {
+    if (buttonPressed)
+    {
+      buttonPressed = 0;
+
+      _delay_ms(100);
+      uint16_t adcVal = adc_read(2);
+      uint16_t millivolts = (uint32_t)adcVal * 5000 / 1023;
+
+      sprintf(serialString, "\nLight = %u mV", millivolts);
+      serial0_print_string(serialString);    
+    }
+  }
+  return(1);
+}//end main 
+
+ISR(INT2_vect)
+{
+  buttonPressed = 1;
+}
