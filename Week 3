@@ -49,3 +49,59 @@ ISR(INT2_vect)
 {
   buttonPressed = 1;
 }
+
+
+
+ //Example ATmega2560 Project
+//File: ATmega2560Project.c
+//An example file for second year mechatronics project
+
+//include this .c file's header file
+#include "Controller.h"
+
+#define DEBOUNCE_PERIOD 1000
+
+volatile uint8_t count = 0;
+volatile uint8_t debounced = 0;
+volatile uint32_t previousTime = 0;
+
+int main(void)
+{
+  milliseconds_init();
+
+  cli();
+  DDRD &= ~(1<<PD2);
+  PORTD |= (1<<PD2);  
+  EICRA |=  (1<<ISC21);
+  EICRA &= ~(1<<ISC20); // INT0 falling edge trigger
+  EIMSK |=  (1<<INT2);  // INT0 enable
+  sei();
+
+  serial0_init();
+  char serialString[60] = {};
+
+  while(1) // main loop
+  {
+    if(debounced)
+    {
+      debounced = 0;
+      sprintf(serialString, "\nBounce Count: %u", count);
+      serial0_print_string(serialString);
+      count = 0;
+    }
+  }
+  return(1);
+}//end main 
+
+ISR(INT2_vect)
+{
+    uint32_t currentTime = milliseconds_now();
+
+    count++;
+
+    if((currentTime - previousTime) > DEBOUNCE_PERIOD)
+    {
+      debounced = 1;
+      previousTime = currentTime;
+    }
+}
