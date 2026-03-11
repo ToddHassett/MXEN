@@ -1,0 +1,110 @@
+# task 1
+
+int main(void)
+{
+    // Set pin 9 as OUTPUT
+    DDRH |= (1 << PH6);
+
+    serial0_init();
+    char serialString[60] = {};
+
+    while(1) // main loop
+    {
+        // Lamp ON
+        PORTH |= (1 << PH6);
+        sprintf(serialString, "\nLamp ON");
+        serial0_print_string(serialString);
+        milliseconds_delay(500);
+
+        // Lamp OFF
+        PORTH &= ~(1 << PH6);
+        sprintf(serialString, "\nLamp OFF");
+        serial0_print_string(serialString);
+        milliseconds_delay(500);
+    }
+
+    return(1);
+}
+
+# task 2
+
+int main() {
+    int cycleCount = 0;
+    char buffer[32];
+
+    while(1) {  
+        cycleCount++;
+        
+        // Lamp ON
+        sprintf(buffer, "Cycle %d: Lamp ON", cycleCount);
+        printf("%s\n", buffer);
+        sleep(1);  // wait 1 second
+        
+        // Lamp OFF
+        sprintf(buffer, "Cycle %d: Lamp OFF", cycleCount);
+        printf("%s\n", buffer);
+        sleep(1);  // wait 1 second
+    }
+    
+    return 0;
+}
+
+# task 3
+
+// ATmega2560 Project
+// File: ATmega2560Project.c
+// Task 3 - DC motor triggered by range sensor using 2N3904 transistor
+
+#include "Controller.h"
+
+#define MOTOR_PIN PH6
+#define SENSOR_PIN 0        // Analog pin A0
+#define THRESHOLD 10        // 10cm threshold from lab briefing
+
+int main(void)
+{
+    // Set motor pin as OUTPUT
+    DDRH |= (1 << MOTOR_PIN);
+
+    // Initialise ADC and serial
+    adc_init();
+    serial0_init();
+    char serialString[60] = {};
+
+    while(1) // main loop
+    {
+        // Read raw sensor value from analog pin
+        uint16_t raw = adc_read(SENSOR_PIN);
+
+        // Convert raw ADC to voltage
+        float voltage = raw * (5.0 / 1023.0);
+
+        // Convert voltage to distance in cm
+        // Using GP2D120 inverse formula from datasheet
+        float distance = 1.0 / ((voltage / 2.5) - 0.42);
+
+        // Print distance to serial terminal
+        sprintf(serialString, "\nDistance: %.1f cm", distance);
+        serial0_print_string(serialString);
+
+        // Trigger motor if object within 10cm
+        if(distance < THRESHOLD)
+        {
+            // Motor ON - set pin HIGH to saturate transistor
+            PORTH |=  (1 << MOTOR_PIN);
+            sprintf(serialString, "\nObject detected! Motor ON");
+            serial0_print_string(serialString);
+        }
+        else
+        {
+            // Motor OFF - set pin LOW to cut base current
+            PORTH &= ~(1 << MOTOR_PIN);
+            sprintf(serialString, "\nNo object. Motor OFF");
+            serial0_print_string(serialString);
+        }
+
+        milliseconds_delay(100);
+    }
+
+    return(1);
+} // end main
