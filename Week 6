@@ -1,0 +1,85 @@
+//Example ATmega2560 Project
+//File: ATmega2560Project.c
+//An example file for second year mechatronics project
+
+#include "Controller.h"
+
+// Servo pulse widths (in 0.5us timer ticks)
+#define SERVO_MID_OCR  3040   // 90 degrees (centre)
+#define SERVO_MIN_OCR  2000   // minimum safe pulse
+#define SERVO_MAX_OCR  4000   // maximum safe pulse
+
+// Which ADC channels the joystick is connected to
+#define JOYSTICK_X  0
+#define JOYSTICK_Y  1
+
+// Converts an angle (0 to 180 degrees) into a timer OCR value
+uint16_t angle_to_ocr(uint16_t angle)
+{
+    // Formula from servo datasheet: OCR = 20 * angle + 1240
+    uint16_t ocr = 20 * angle + 1240;
+
+    // Keep the value within the safe range for the servo
+    if (ocr < SERVO_MIN_OCR) ocr = SERVO_MIN_OCR;
+    if (ocr > SERVO_MAX_OCR) ocr = SERVO_MAX_OCR;
+
+    return ocr;
+}
+
+// Converts a raw ADC reading (0 to 1023) into an angle (0 to 180 degrees)
+uint16_t joystick_to_angle(uint16_t raw)
+{
+    return (uint32_t)raw * 180 / 1023;
+}
+
+int main(void)
+{
+    // Initialise peripherals
+    milliseconds_init();
+    serial0_init();
+    adc_init();
+
+    // --- PWM setup ---
+    cli(); // Disable interrupts during setup
+
+    // Make PB5 (OC1A) and PB6 (OC1B) output pins
+    DDRB |= (1 << PB5) | (1 << PB6);
+
+    // Configure Timer1 for Fast PWM, non-inverting mode
+    TCCR1A = (1 << COM1A1) | (1 << COM1B1) | (1 << WGM11);
+    TCCR1B = (1 << WGM13)  | (1 << WGM12)  | (1 << CS11);
+
+    // Set timer top to give a 20ms (50Hz) period
+    // ICR1 = (16MHz / (prescaler 8 * 50Hz)) - 1 = 39999
+    ICR1 = 39999;
+
+    // Start both servos at centre (90 degrees)
+    OCR1A = SERVO_MID_OCR;
+    OCR1B = SERVO_MID_OCR;
+
+    sei(); // Re-enable interrupts
+
+    char buf[48];
+    serial0_print_string("\nServo control ready.");
+
+    while (1)
+    {
+        // Read the joystick position (0 to 1023)
+        uint16_t joy_x = adc_read(JOYSTICK_X);
+        uint16_t joy_y = adc_read(JOYSTICK_Y);
+
+        // Convert joystick readings to angles (0 to 180 degrees)
+        uint16_t angle1 = joystick_to_angle(joy_x);
+        uint16_t angle2 = joystick_to_angle(joy_y);
+
+        // Drive the servos to the new angles
+        OCR1A = angle_to_ocr(angle1);
+        OCR1B = angle_to_ocr(angle2);
+
+        // Print the current angles over serial
+        sprintf(buf, "\nServo1: %u deg  Servo2: %u deg", angle1, angle2);
+        serial0_print_string(buf);
+
+        milliseconds_delay(20);
+    }
+}
