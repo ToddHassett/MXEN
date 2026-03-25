@@ -1,0 +1,151 @@
+#include "Controller.h"
+
+#define TRIGGER_ECHO_PIN PD2
+
+#define HOLDOFF_TICKS  94    // 94 × 8us = 752us
+#define DELAY_TICKS    25    // 25 × 8us = 200us
+#define TIMEOUT_TICKS  2313  // 2313 × 8us = 18.5ms
+
+// 0 = idle, 1 = init trigger, 2 = wait holdoff, 3 = wait rising edge
+// 4 = wait falling edge, 5 = calculate, 6 = delay, 7 = errors
+volatile uint8_t state = 0;
+volatile uint16_t timer_count = 0; // num of timer ticks during echo
+volatile uint16_t echo_start = 0; //stores timer value of rising edge detection to calculate pulse width
+volatile uint16_t timeout_count = 0; //counts ticks for timeout and delay periods
+
+void init_timer1()
+{
+    TCCR1A = 0; // normal mode
+    TCCR1B = (1 << CS11); // prescaler = 8 (0.5us per tick)
+    TCNT1 = 0; // reset counter to zero at startup
+    TIMSK1 = (1 << OCIE1A); // enable compare match A interrupt
+    OCR1A = 16; // interrupt fires every 16 ticks = every 8us
+}
+
+void init_int0()
+{
+    DDRD &= ~(1 << TRIGGER_ECHO_PIN); // SIG pin to input
+    EICRA |= (1 << ISC00) | (1 << ISC01); // INT0 for rising edge detection
+    EIMSK &= ~(1 << INT0); // INT0 disabled until after holdoff period
+}
+
+void start_trigger()
+{
+    DDRD |= (1 << TRIGGER_ECHO_PIN); // switch SIG pin to output to send trigger pulse
+    PORTD |= (1 << TRIGGER_ECHO_PIN); // pull SIG pin HIGH to start the trigger pulse
+    TCNT1 = 0; // reset timer
+    state = 1; // move to trigger state
+}
+
+uint16_t calculate_distance(uint16_t ticks)
+{
+    // based on speed of sound: 1cm takes 58us round trip
+    return (ticks * 2) / 58;
+}
+
+ISR(TIMER1_COMPA_vect)
+{
+    timeout_count++; // every 8us
+
+    if(state == 1) // trigger pulse sent to sensor
+    {
+        if(timeout_count >= 6)
+        // 6 ticks x 8us = 48us which is close to the 5us typical trigger
+        {
+            PORTD &= ~(1 << TRIGGER_ECHO_PIN); // SIG pin LOW to end the trigger pulse
+            DDRD &= ~(1 << TRIGGER_ECHO_PIN); // SIG pin back to input to listen for echo
+            timeout_count = 0; // reset counter
+            state = 2; // holdoff wait state
+        }
+    }
+    else if(state == 2) // wait for 750us holdoff
+    {
+        if(timeout_count >= HOLDOFF_TICKS) //waiting
+        {
+            timeout_count = 0;
+            EICRA |= (1 << ISC00) | (1 << ISC01); // INT0 rising edge
+            EIMSK |= (1 << INT0); // enable INT0 now that holdoff has passed
+            state = 3; // waiting for rising edge
+        }
+    }
+    else if(state == 4) // echo rising edge received
+    {
+        if(timeout_count >= TIMEOUT_TICKS) // if echo not received within 18.5ms
+        {
+            EIMSK &= ~(1 << INT0); // disable INT0
+            timeout_count = 0;
+            state = 7; // move to timeout error state
+        }
+    }
+    else if(state == 6) // wait 200us between measurements
+    {
+        if(timeout_count >= DELAY_TICKS) // once 200us is over
+        {
+            timeout_count = 0;
+            state = 0; // return to idle
+        }
+    }
+}
+
+ISR(INT0_vect) // change in INT0
+{
+    if(state == 3) // detection of rising edge
+    {
+        echo_start = TCNT1; // record time at echo start
+        timeout_count = 0;
+        EICRA &= ~(1 << ISC00); // change INT0 to falling edge detection
+        EICRA |= (1 << ISC01);
+        state = 4; // move to waiting for echo end
+    }
+    else if(state == 4) // detection of falling edge
+    {
+        timer_count = TCNT1 - echo_start; // pulse width = end time minus start time
+        EIMSK &= ~(1 << INT0); // disable INT0
+        timeout_count = 0;
+        state = 5; // calculate state
+    }
+}
+
+int main(void)
+{
+    serial0_init();
+
+    cli();
+    init_timer1();
+    init_int0();
+    sei();
+
+    char serialString[60] = {};
+
+    while(1) //only handles transistions of state that require serial output
+    {
+        if(state == 0) // idle
+        {
+            start_trigger();
+        }
+        else if(state == 5) // echo recieved and times, convert to distance and print
+        {
+            uint16_t distance = calculate_distance(timer_count);
+
+            if(distance < 2 || distance > 300)
+            {
+                sprintf(serialString, "\nOut of range");
+            }
+            else
+            {
+                sprintf(serialString, "\nDistance: %u cm", distance);
+            }
+
+            serial0_print_string(serialString); 
+            state = 6; // delay before next measurement
+        }
+        else if(state == 7) // timeout occured
+        {
+            sprintf(serialString, "\nNo echo received - timeout");
+            serial0_print_string(serialString);
+            state = 6; // delay before next measurement
+        }
+    }
+
+    return(1);
+}
