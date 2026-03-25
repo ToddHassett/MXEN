@@ -1,3 +1,66 @@
+#include "Controller.h"
+
+#define SERVO_MID_OCR  3040
+#define SERVO_MIN_OCR  2000
+#define SERVO_MAX_OCR  4000
+
+#define JOYSTICK_X  0
+
+uint16_t angle_to_ocr(uint16_t angle)
+{
+    uint16_t ocr = 20 * angle + 1240;
+
+    if (ocr < SERVO_MIN_OCR) ocr = SERVO_MIN_OCR;
+    if (ocr > SERVO_MAX_OCR) ocr = SERVO_MAX_OCR;
+
+    return ocr;
+}
+
+uint16_t joystick_to_angle(uint16_t raw)
+{
+    return (uint32_t)raw * 180 / 1023;
+}
+
+int main(void)
+{
+    milliseconds_init();
+    serial0_init();
+    adc_init();
+
+    cli();
+
+    DDRB |= (1 << PB5);
+
+    TCCR1A = (1 << COM1A1) | (1 << WGM11);
+    TCCR1B = (1 << WGM13)  | (1 << WGM12) | (1 << CS11);
+
+    ICR1  = 39999;
+    OCR1A = SERVO_MID_OCR;
+
+    sei();
+
+    char buf[48];
+    serial0_print_string("\nServo control ready.");
+
+    while (1)
+    {
+        uint16_t joy_x = adc_read(JOYSTICK_X);
+        uint16_t angle = joystick_to_angle(joy_x);
+        OCR1A = angle_to_ocr(angle);
+
+        sprintf(buf, "\nJoy x: %u", joy_x);
+        serial0_print_string(buf);
+
+        _delay_ms(20);
+    }
+}
+
+
+
+
+
+
+
 //Example ATmega2560 Project
 //File: ATmega2560Project.c
 //An example file for second year mechatronics project
