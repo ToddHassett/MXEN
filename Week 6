@@ -143,6 +143,69 @@ int main(void)
         sprintf(buf, "\nServo1: %u deg  Servo2: %u deg", angle1, angle2);
         serial0_print_string(buf);
 
+
+
+
+#include "Controller.h"
+
+#define SERVO_MID_OCR  3040
+#define SERVO_MIN_OCR  2000
+#define SERVO_MAX_OCR  4000
+
+#define JOYSTICK_X  0
+#define JOYSTICK_Y  2
+
+
+uint32_t calc_ocr(uint32_t joy)
+{
+    uint32_t ocr = joy * 2000 / 1023 + 2000;
+
+    if (ocr < SERVO_MIN_OCR) ocr = SERVO_MIN_OCR;
+    if (ocr > SERVO_MAX_OCR) ocr = SERVO_MAX_OCR;
+
+    return ocr;
+}
+
+
+
+int main(void)
+{
+    milliseconds_init();
+    serial0_init();
+    adc_init();
+
+    cli();
+
+    DDRB |= (1 << PB5) | (1 << PB6);
+
+    TCCR1A = (1 << COM1A1) | (1 << COM1B1) | (1 << WGM11);
+    TCCR1B = (1 << WGM13) | (1 << WGM12) |(1 << CS11);
+
+    ICR1 = 39999;
+
+    OCR1A = SERVO_MID_OCR;
+    OCR1B = SERVO_MID_OCR;
+
+    sei();
+
+    char serialString[64];
+
+    while (1)
+    {
+        uint32_t joy_x = adc_read(JOYSTICK_X);
+        uint32_t joy_y = adc_read(JOYSTICK_Y);
+        uint32_t ocr1 = calc_ocr(joy_x);
+        uint32_t ocr2 = calc_ocr(joy_y);
+        OCR1A = ocr1;
+        OCR1B = ocr2;
+
+        sprintf(serialString, "\nOCR value: %u OCR2 value: %02u", ocr1, ocr2);
+        serial0_print_string(serialString);
+
+        _delay_ms(20);
+    }
+}
+
         milliseconds_delay(20);
     }
 }
