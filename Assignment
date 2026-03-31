@@ -2,9 +2,9 @@
 
 #define TRIGGER_ECHO_PIN PD2
 
-#define HOLDOFF_TICKS  94    // 94 × 8us = 752us
-#define DELAY_TICKS    25    // 25 × 8us = 200us
-#define TIMEOUT_TICKS  2313  // 2313 × 8us = 18.5ms
+#define HOLDOFF_TICKS  94 // 94 × 8us = 752us
+#define DELAY_TICKS    25 // 25 × 8us = 200us
+#define TIMEOUT_TICKS  2313 // 2313 × 8us = 18.5ms
 
 // 0 = idle, 1 = init trigger, 2 = wait holdoff, 3 = wait rising edge
 // 4 = wait falling edge, 5 = calculate, 6 = delay, 7 = errors
@@ -39,8 +39,7 @@ void start_trigger()
 
 uint16_t calculate_distance(uint16_t ticks)
 {
-    // based on speed of sound: 1cm takes 58us round trip
-    return (ticks * 2) / 58;
+    return (ticks / 2) / 58; // based on speed of sound: 1cm takes 58us round trip
 }
 
 ISR(TIMER1_COMPA_vect)
@@ -49,14 +48,10 @@ ISR(TIMER1_COMPA_vect)
 
     if(state == 1) // trigger pulse sent to sensor
     {
-        if(timeout_count >= 6)
-        // 6 ticks x 8us = 48us which is close to the 5us typical trigger
-        {
-            PORTD &= ~(1 << TRIGGER_ECHO_PIN); // SIG pin LOW to end the trigger pulse
-            DDRD &= ~(1 << TRIGGER_ECHO_PIN); // SIG pin back to input to listen for echo
-            timeout_count = 0; // reset counter
-            state = 2; // holdoff wait state
-        }
+        PORTD &= ~(1 << TRIGGER_ECHO_PIN); // SIG pin LOW to end the trigger pulse
+        DDRD &= ~(1 << TRIGGER_ECHO_PIN); // SIG pin back to input to listen for echo
+        timeout_count = 0; // reset counter
+        state = 2; // holdoff wait state
     }
     else if(state == 2) // wait for 750us holdoff
     {
