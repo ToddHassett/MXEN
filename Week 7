@@ -1,0 +1,398 @@
+ROBOT
+
+#include "adc.h"
+#include "Robot.h"
+
+void GPIO_init()
+{
+    DDRB |= (1 << PB5) | (1 << PB6);
+    PORTB = 0;
+    DDRF = 0x00;
+    PORTF = 0;
+}
+
+void servo_init()
+{
+    TCCR1A = (1 << COM1A1) | (1 << COM1B1) | (1 << WGM11);
+    TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS11);
+    ICR1 = 39999;
+    OCR1A = 2000;
+    OCR1B = 2000;
+}
+
+uint16_t angle_to_ticks(uint8_t angle)
+{
+    // t(us) = 10 * angle + 620
+    // ticks = us / 0.5 = (10 * angle + 620) * 2
+    uint16_t ticks = (10 * (uint16_t)angle + 620) * 2;
+
+    if(ticks < 2000) ticks = 2000; // never below 1ms
+    if(ticks > 4000) ticks = 4000; // never above 2ms
+
+    return ticks;
+}
+
+
+int main(void)
+{
+    cli();
+    adc_init();
+    _delay_ms(20);
+    serial2_init();
+    _delay_ms(20);
+    GPIO_init();
+    servo_init();
+    sei();
+
+    uint8_t databyte1 = 0;
+    uint8_t databyte2 = 0;
+    uint8_t command = 0;
+    uint8_t command_value = 0;
+    uint8_t receivedData[3];
+
+    while(1)
+    {
+        // command byte — 0x10 identifies this as robot sensor data
+        databyte1 = 0x10;
+
+        // read photo resistor on PF0, scale to 0-100
+        databyte2 = (uint8_t)(((uint16_t)(adc_read(PF0) >> 2) * 100) / 255);
+
+        // receive commands from controller
+        if(serial2_available())
+        {
+            serial2_get_data(receivedData, 3);
+
+            // verify checksum before acting on command
+            if(receivedData[2] == (receivedData[0] ^ receivedData[1] ^ 0xFF))
+            {
+                command = receivedData[0];
+                command_value = receivedData[1];
+            }
+            else
+            {
+                // checksum failed - ignore packet
+                command = 0x00;
+                command_value = 0;
+            }
+
+            // if servo control command received
+            if(command == 0x01)
+            {
+                OCR1A = angle_to_ticks(command_value);
+            }
+
+            // send photo resistor reading back to controller
+            uint8_t check = databyte1 ^ databyte2 ^ 0xFF;
+            serial2_write_bytes(3, databyte1, databyte2, check);
+        }
+    }
+    return 0;
+}
+
+#include "Controller.h"
+
+void GPIO_init()
+{
+    DDRA = 0x00;
+    PORTF = 0;
+}
+
+
+int main(void)
+{
+    DDRA = 0xFF;
+    PORTA = 0;
+
+    GPIO_init();
+    lcd_init();
+    _delay_ms(20);
+    adc_init();
+    _delay_ms(20);
+    serial2_init();
+    serial0_init();
+    milliseconds_init();
+
+    uint8_t databyte1 = 0;
+    uint8_t databyte2 = 0;
+    uint16_t last_send_ms = 0;
+    uint8_t receivedData[3];
+    char serial_string[60] = {0};
+
+    lcd_clrscr();
+    lcd_home();
+    lcd_goto(0x00);
+    lcd_puts("init");
+    _delay_ms(3000);
+    lcd_clrscr();
+
+    while(1)
+    {
+        uint16_t current_ms = milliseconds_now();
+
+        // command byte — 0x01 means servo control
+        databyte1 = 0x01;
+
+        // read left joystick vertical axis on PA0, scale to 0-180 for servo
+        databyte2 = (uint8_t)(((uint16_t)(adc_read(PA0) >> 2) * 180) / 255);
+
+        // send every 100ms
+        if((current_ms - last_send_ms) >= 100)
+        {
+            // checksum = XOR of both data bytes with 0xFF
+            uint8_t check = databyte1 ^ databyte2 ^ 0xFF;
+            serial2_write_bytes(3, databyte1, databyte2, check);
+            last_send_ms = current_ms;
+        }
+
+        // receive photo resistor data from robot
+        if(serial2_available())
+        {
+            serial2_get_data(receivedData, 3);
+
+            // verify checksum before using data
+            if(receivedData[2] == (receivedData[0] ^ receivedData[1] ^ 0xFF))
+            {
+                // receivedData[0] = command byte from robot
+                // receivedData[1] = photo resistor value 0-180
+                sprintf(serial_string, "cmd:%3u val:%3u", receivedData[0], receivedData[1]);
+                lcd_home();
+                lcd_clrscr();
+                lcd_puts(serial_string);
+
+                // interpret light direction on second LCD line
+                lcd_goto(0x40);
+                uint8_t lightVal = receivedData[1];
+
+                if(lightVal < 30)
+                {
+                    lcd_puts("STOP");
+                }
+                else if(lightVal < 80)
+                {
+                    lcd_puts("LOW LIGHT");
+                }
+                else
+                {
+                    lcd_puts("VISIBLE LIGHT");
+                }
+            }
+            else
+            {
+                lcd_clrscr();
+                lcd_puts("DATA BAD");
+            }
+        }
+    }
+    return(1);
+}
+
+
+#include "serial.h"
+
+volatile bool serial0DataReady = false;
+volatile bool serial2DataReady = false;
+
+volatile uint8_t serial0DataByte1 = 0;
+volatile uint8_t serial0DataByte2 = 0;
+volatile uint8_t serial0DataByte3 = 0;
+volatile uint8_t serial0DataByte4 = 0;
+volatile uint8_t serial0DataByte5 = 0;
+volatile uint8_t serial0DataByte6 = 0;
+
+volatile uint8_t serial2DataByte1 = 0;
+volatile uint8_t serial2DataByte2 = 0;
+volatile uint8_t serial2DataByte3 = 0;
+volatile uint8_t serial2DataByte4 = 0;
+volatile uint8_t serial2DataByte5 = 0;
+volatile uint8_t serial2DataByte6 = 0;
+
+void serial0_init(void)
+{
+    UCSR0B = (1<<RXEN0)|(1<<TXEN0);
+    UCSR0C = (1<<UCSZ00)|(1<<UCSZ01);
+    UBRR0 = BAUD_PRESCALE0;
+    UCSR0B |= (1 << RXCIE0);
+}
+
+bool serial0_available()
+{
+    return serial0DataReady;
+}
+
+void serial0_print_string(char * string_pointer)
+{
+    while(*string_pointer)
+    {
+        while((UCSR0A&(1<<UDRE0))==0){}
+        UDR0 = *string_pointer;
+        string_pointer++;
+    }
+}
+
+void serial0_write_byte(uint8_t data_byte)
+{
+    while((UCSR0A&(1<<UDRE0))==0){}
+    UDR0 = data_byte;
+}
+
+void serial0_write_bytes(uint8_t numBytes, ...)
+{
+    va_list databytes;
+    va_start(databytes, numBytes);
+    serial0_write_byte(0xFF);
+    serial0_write_byte(numBytes);
+    for(uint8_t i=0; i<numBytes; i++)
+    {
+        serial0_write_byte(va_arg(databytes,int));
+    }
+    serial0_write_byte(0xFE);
+    va_end(databytes);
+}
+
+void serial0_get_data(uint8_t *data, uint8_t size)
+{
+    cli();
+    uint8_t tempData[6] = {serial0DataByte1, serial0DataByte2, serial0DataByte3,
+                           serial0DataByte4, serial0DataByte5, serial0DataByte6};
+    sei();
+    for(uint8_t i = 0; i<size; i++)
+    {
+        data[i] = tempData[i];
+    }
+    serial0DataReady = false;
+}
+
+ISR(USART0_RX_vect)
+{
+    static uint8_t recvByte1=0, recvByte2=0, recvByte3=0,
+                   recvByte4=0, recvByte5=0, recvByte6=0;
+    static uint8_t serial_fsm_state = 0;
+    static uint8_t numBytes = 6;
+    uint8_t serial_byte_in = UDR0;
+
+    if(serial_byte_in == 0xFE)
+    {
+        if(serial_fsm_state == numBytes)
+        {
+            serial0DataByte1 = recvByte1;
+            serial0DataByte2 = recvByte2;
+            serial0DataByte3 = recvByte3;
+            serial0DataByte4 = recvByte4;
+            serial0DataByte5 = recvByte5;
+            serial0DataByte6 = recvByte6;
+            serial0DataReady = true;
+        }
+        serial_fsm_state = 0;
+    }
+    switch(serial_fsm_state)
+    {
+        case 0: break;
+        case 1: numBytes = serial_byte_in + 2; serial_fsm_state++; break;
+        case 2: recvByte1 = serial_byte_in;    serial_fsm_state++; break;
+        case 3: recvByte2 = serial_byte_in;    serial_fsm_state++; break;
+        case 4: recvByte3 = serial_byte_in;    serial_fsm_state++; break;
+        case 5: recvByte4 = serial_byte_in;    serial_fsm_state++; break;
+        case 6: recvByte5 = serial_byte_in;    serial_fsm_state++; break;
+        case 7: recvByte6 = serial_byte_in;    serial_fsm_state++; break;
+    }
+    if(serial_byte_in == 0xFF)
+    {
+        serial_fsm_state = 1;
+    }
+}
+
+void serial2_init(void)
+{
+    UCSR2B = (1<<RXEN2)|(1<<TXEN2);
+    UCSR2C = (1<<UCSZ20)|(1<<UCSZ21);
+    UBRR2 = BAUD_PRESCALE;
+    UCSR2B |= (1 << RXCIE2);
+}
+
+bool serial2_available()
+{
+    return serial2DataReady;
+}
+
+void serial2_print_string(char * string_pointer)
+{
+    while(*string_pointer)
+    {
+        while((UCSR2A&(1<<UDRE2))==0){}
+        UDR2 = *string_pointer;
+        string_pointer++;
+    }
+}
+
+void serial2_write_byte(uint8_t data_byte)
+{
+    while((UCSR2A&(1<<UDRE2))==0){}
+    UDR2 = data_byte;
+}
+
+void serial2_write_bytes(uint8_t numBytes, ...)
+{
+    va_list databytes;
+    va_start(databytes, numBytes);
+    serial2_write_byte(0xFF);
+    serial2_write_byte(numBytes);
+    for(uint8_t i=0; i<numBytes; i++)
+    {
+        serial2_write_byte(va_arg(databytes,int));
+    }
+    serial2_write_byte(0xFE);
+    va_end(databytes);
+}
+
+void serial2_get_data(uint8_t *data, uint8_t size)
+{
+    cli();
+    uint8_t tempData[6] = {serial2DataByte1, serial2DataByte2, serial2DataByte3,
+                           serial2DataByte4, serial2DataByte5, serial2DataByte6};
+    sei();
+    for(uint8_t i = 0; i<size; i++)
+    {
+        data[i] = tempData[i];
+    }
+    serial2DataReady = false;
+}
+
+ISR(USART2_RX_vect)
+{
+    static uint8_t recvByte1=0, recvByte2=0, recvByte3=0,
+                   recvByte4=0, recvByte5=0, recvByte6=0;
+    static uint8_t serial_fsm_state = 0;
+    static uint8_t numBytes = 6;
+    uint8_t serial_byte_in = UDR2;
+
+    if(serial_byte_in == 0xFE)
+    {
+        if(serial_fsm_state == numBytes)
+        {
+            serial2DataByte1 = recvByte1;
+            serial2DataByte2 = recvByte2;
+            serial2DataByte3 = recvByte3;
+            serial2DataByte4 = recvByte4;
+            serial2DataByte5 = recvByte5;
+            serial2DataByte6 = recvByte6;
+            serial2DataReady = true;        // fixed from original bug
+        }
+        serial_fsm_state = 0;
+    }
+    switch(serial_fsm_state)
+    {
+        case 0: break;
+        case 1: numBytes = serial_byte_in + 2; serial_fsm_state++; break;
+        case 2: recvByte1 = serial_byte_in;    serial_fsm_state++; break;
+        case 3: recvByte2 = serial_byte_in;    serial_fsm_state++; break;
+        case 4: recvByte3 = serial_byte_in;    serial_fsm_state++; break;
+        case 5: recvByte4 = serial_byte_in;    serial_fsm_state++; break;
+        case 6: recvByte5 = serial_byte_in;    serial_fsm_state++; break;
+        case 7: recvByte6 = serial_byte_in;    serial_fsm_state++; break;
+    }
+    if(serial_byte_in == 0xFF)
+    {
+        serial_fsm_state = 1;
+    }
+}
