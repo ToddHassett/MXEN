@@ -1,0 +1,187 @@
+Hi Mitch, I made this late and I'm really tired so if im not at uni on time sorry xx
+
+#include "Robot.h"
+
+void motor_pwm_init(void);
+void GPIO_init(void);
+void set_motors(int16_t lm, int16_t rm);
+
+int main(void)
+{
+    cli();
+    _delay_ms(20);
+    serial2_init();
+    _delay_ms(20);
+    GPIO_init();
+    motor_pwm_init();
+    sei();
+
+    uint8_t command = 0;
+    uint8_t receivedData[4];
+
+    while(1)
+    {
+        if(serial2_available())
+        {
+            serial2_get_data(receivedData, 4);
+
+            // checksum covers data bytes
+            if(receivedData[3] == (receivedData[0] ^ receivedData[1] ^ receivedData[2] ^ 0xFF))
+            {
+                command = receivedData[0];
+            }
+            else
+            {
+                command = 0x00;
+            }
+
+            if(command == 0x02)
+            {
+                int16_t fc = receivedData[1];
+                int16_t rc = receivedData[2];
+
+                int16_t lm = fc + rc - 253;
+                int16_t rm = fc - rc;
+
+                set_motors(lm, rm);
+            }
+        }
+    }
+    return(0);
+}
+
+void set_motors(int16_t lm, int16_t rm)
+{
+    OCR3A = (int32_t)abs(lm) * 10000 / 126; //maybe try 9999
+    OCR3B = (int32_t)abs(rm) * 10000 / 126;
+
+    if(lm >= 0)
+    {
+        PORTA |= (1 << PA0);
+        PORTA &= ~(1 << PA1);
+    }
+    else
+    {
+        PORTA &= ~(1 << PA0);
+        PORTA |= (1 << PA1);
+    }
+
+    if(rm >= 0)
+    {
+        PORTA |= (1 << PA2);
+        PORTA &= ~(1 << PA3);
+    }
+    else
+    {
+        PORTA &= ~(1 << PA2);
+        PORTA |= (1 << PA3);
+    }
+}
+
+void motor_pwm_init(void)
+{
+    TCCR3A = (1 << COM3A1) | (1 << COM3B1) | (1 << WGM31);
+    TCCR3B = (1 << WGM33) | (1 << CS31);
+    ICR3 = 9999;
+    OCR3A = 0;
+    OCR3B = 0;
+}
+
+void GPIO_init(void)
+{
+    DDRA |= (1 << DDA0) | (1 << DDA1) | (1 << DDA2) | (1 << DDA3);
+    PORTA = 0;
+    DDRB |= (1 << PB6) | (1 << PB7);
+}
+
+#include "Controller.h"
+
+void GPIO_init(void);
+
+int main(void)
+{
+    GPIO_init();
+    lcd_init();
+    _delay_ms(20);
+    adc_init();
+    _delay_ms(20);
+    serial2_init();
+    serial0_init();
+    milliseconds_init();
+
+    uint8_t databyte1 = 0;
+    uint8_t databyte2 = 0;
+    uint8_t databyte3 = 0;
+    uint16_t last_send_ms = 0;
+    char serial_string[60] = {0};
+    char lcd_string[33] = {0};
+
+    lcd_clrscr();
+    lcd_home();
+    lcd_goto(0x00);
+    lcd_puts("init");
+    _delay_ms(3000);
+    lcd_clrscr();
+
+    while(1)
+    {
+        uint16_t current_ms = milliseconds_now();
+
+        databyte1 = 0x02;
+
+        uint8_t fc = (uint8_t)(((uint32_t)(adc_read(PA1) >> 2) * 253) / 255);
+        uint8_t rc = (uint8_t)(((uint32_t)(adc_read(PA0) >> 2) * 253) / 255);
+
+        databyte2 = fc;
+        databyte3 = rc;
+
+        if((current_ms - last_send_ms) >= 100)
+        {
+            uint8_t check = databyte1 ^ databyte2 ^ databyte3 ^ 0xFF;
+            serial2_write_bytes(4, databyte1, databyte2, databyte3, check);
+            last_send_ms = current_ms;
+        }
+
+        // update LCD top line with joystick values
+        lcd_goto(0x00);
+        sprintf(lcd_string, "fc:%3u rc:%3u   ", fc, rc);
+        lcd_puts(lcd_string);
+
+        // update LCD bottom line with direction
+        lcd_goto(0x40);
+
+        // dead zone: joystick centre is 126, threshold of 10
+        int16_t fc_centred = (int16_t)fc - 126;
+        int16_t rc_centred = (int16_t)rc - 126;
+
+        if(abs(fc_centred) < 10 && abs(rc_centred) < 10)
+        {
+            lcd_puts("STOP");
+        }
+        else if(abs(rc_centred) > abs(fc_centred))
+        {
+            if(rc_centred > 0)
+                lcd_puts("RIGHT");
+            else
+                lcd_puts("LEFT");
+        }
+        else if (fc_centred < 0 && abs(rc_centred) < 10)
+        {
+            lcd_puts("REVERSE");
+        }
+        else
+        {
+            lcd_puts("FORWARD");
+        }
+
+        sprintf(serial_string, "\nfc:%3u rc:%3u", fc, rc);
+        serial0_print_string(serial_string);
+    }
+    return(0);
+}
+
+void GPIO_init(void)
+{
+    DDRA = 0x00;
+    PORTF = 0;
+}
