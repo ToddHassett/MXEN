@@ -1,0 +1,113 @@
+#include "Robot.h"
+
+void motor_pwm_init(void);
+void GPIO_init(void);
+void set_motors(int16_t lm, int16_t rm);
+
+int main(void)
+{
+    cli();
+    _delay_ms(20);
+    serial0_init();
+    serial2_init();
+    adc_init();
+    _delay_ms(20);
+    GPIO_init();
+    motor_pwm_init();
+    char serial_string[60] = {0};
+    sei();
+
+    uint8_t command = 0;
+    uint8_t receivedData[4];
+
+    while(1)
+    {
+        if(serial2_available())
+        {
+            serial2_get_data(receivedData, 4);
+
+            if(receivedData[3] == (receivedData[0] ^ receivedData[1] ^ receivedData[2] ^ 0xFF))
+            {
+                command = receivedData[0];
+            }
+            else
+            {
+                command = 0x00;
+            }
+
+            if(command == 0x02)
+            {
+                int16_t fc = (int16_t)receivedData[1];
+                int16_t rc = (int16_t)receivedData[2];
+
+                int16_t fc_centered = fc - 126;
+                int16_t rc_centered = rc - 126;
+
+                int16_t lm = fc + rc;
+                int16_t rm = fc - rc;
+
+                set_motors(lm, rm);
+
+                // Read battery voltage on A1 (PF1)
+                // Voltage divider: R1 = 10k (high side), R2 = 3.3k (low side)
+                // adc_read returns 0-1023 relative to 5V (AVCC)
+                // millivolts at the pin = adcVal * 5000 / 1023
+                // actual battery voltage = pin voltage * (R1 + R2) / R2
+                // = pin voltage * 13300 / 3300
+                // = pin voltage * 133 / 33
+                uint16_t adcVal = adc_read(1);
+                uint32_t pinMV = (uint32_t)adcVal * 5000 / 1023;
+                uint32_t batteryMV = pinMV * 133 / 33;
+
+                sprintf(serial_string, "\nBattery = %lu mV", batteryMV);
+                serial0_print_string(serial_string);
+            }
+        }
+    }
+    return(0);
+}
+
+void set_motors(int16_t lm, int16_t rm)
+{
+    OCR3A = (int32_t)abs(lm) * 9999 / 126;
+    OCR3B = (int32_t)abs(rm) * 9999 / 126;
+
+    if(lm >= 0)
+    {
+        PORTA |=  (1 << PA0);
+        PORTA &= ~(1 << PA1);
+    }
+    else
+    {
+        PORTA &= ~(1 << PA0);
+        PORTA |=  (1 << PA1);
+    }
+
+    if(rm >= 0)
+    {
+        PORTA |=  (1 << PA2);
+        PORTA &= ~(1 << PA3);
+    }
+    else
+    {
+        PORTA &= ~(1 << PA2);
+        PORTA |=  (1 << PA3);
+    }
+}
+
+void motor_pwm_init(void)
+{
+    TCCR1A = (1 << COM1A1) | (1 << COM1B1) | (1 << WGM11);
+    TCCR1B = (1 << WGM13)  | (1 << CS11);
+    ICR1   = 9999;
+    OCR1A  = 0;
+    OCR1B  = 0;
+}
+
+void GPIO_init(void)
+{
+    DDRA |= (1 << DDA0) | (1 << DDA1) | (1 << DDA2) | (1 << DDA3);
+
+    DDRB |= (1 << PB5) | (1 << PB6);
+    PORTB = 0;
+}
