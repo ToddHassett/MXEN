@@ -1,0 +1,176 @@
+/*
+ * =======================================================================
+ * test_battery_rover.c
+ * Flash this onto the ROVER board.
+ *
+ * Reads battery voltage from the divider on A1 (PF1),
+ * then sends it to the controller over XBee every 500ms.
+ *
+ * WIRING (rover):
+ *   R1 = 6.8k : battery positive -> junction
+ *   R2 = 6.8k : junction -> GND
+ *   Junction  -> A1 (PF1)
+ *   XBee DIN  <- TX2 (D16) via 2.2k+3.3k divider
+ *   XBee DOUT -> RX2 (D17) direct
+ *
+ * PACKET SENT (4 bytes):
+ *   [0] 0xB0        command byte
+ *   [1] batt_high   mV high byte
+ *   [2] batt_low    mV low byte
+ *   [3] checksum    [0]^[1]^[2]^0xFF
+ * =======================================================================
+ */
+
+#include "Robot.h"
+
+#define VDIV_NUM        2
+#define VDIV_DEN        1
+
+#define CMD_BATT        0xB0
+#define TX_SIZE         4
+
+int main(void)
+{
+    /* PF1 as ADC input, no pull-up */
+    DDRF  &= ~(1 << DDF1);
+    PORTF &= ~(1 << PF1);
+
+    adc_init();
+    serial0_init();
+    serial2_init();
+    _delay_ms(500);
+    milliseconds_init();
+    sei();
+
+    serial0_print_string("Battery rover test ready\n");
+
+    char     buf[40]       = {0};
+    uint32_t last_send_ms  = 0;
+
+    while (1)
+    {
+        uint32_t now = milliseconds_now();
+
+        if ((now - last_send_ms) >= 500)
+        {
+            last_send_ms = now;
+
+            /* Read and scale battery voltage */
+            uint16_t raw    = adc_read(1);
+            uint32_t pin_mv = (uint32_t)raw * 5000 / 1023;
+            uint16_t batt   = (uint16_t)((uint32_t)pin_mv * VDIV_NUM / VDIV_DEN);
+
+            /* Split into two bytes for packet */
+            uint8_t batt_h = (uint8_t)(batt >> 8);
+            uint8_t batt_l = (uint8_t)(batt & 0xFF);
+            uint8_t chk    = CMD_BATT ^ batt_h ^ batt_l ^ 0xFF;
+
+            serial2_write_bytes(TX_SIZE, CMD_BATT, batt_h, batt_l, chk);
+
+            /* Also print locally for sanity check */
+            sprintf(buf, "Sending: %u mV\n", batt);
+            serial0_print_string(buf);
+        }
+    }
+
+    return 0;
+}
+
+
+
+
+
+/*
+ * =======================================================================
+ * test_battery_controller.c
+ * Flash this onto the CONTROLLER board.
+ *
+ * Receives the battery voltage packet from the rover over XBee
+ * and displays it on the LCD.
+ *
+ * LCD LINE 1: battery voltage in mV
+ * LCD LINE 2: "LOW BATT" if below 7200mV, otherwise "OK"
+ *
+ * WIRING (controller - do not rewire):
+ *   XBee DIN  <- TX2 (D16) via divider  (already wired)
+ *   XBee DOUT -> RX2 (D17)              (already wired)
+ *   LCD                                  (already wired)
+ *
+ * EXPECTED LCD OUTPUT (healthy battery ~8.4V):
+ *   Line 1:  Batt:  8350 mV
+ *   Line 2:  Status: OK
+ *
+ * EXPECTED LCD OUTPUT (low battery):
+ *   Line 1:  Batt:  6980 mV
+ *   Line 2:  Status: LOW BATT
+ * =======================================================================
+ */
+
+
+#include "Controller.h"
+
+#define CMD_BATT        0xB0
+#define RX_SIZE         4
+#define BATT_ALERT_MV   7200
+
+int main(void)
+{
+    milliseconds_init();
+    lcd_init();
+    _delay_ms(20);
+    serial2_init();
+    _delay_ms(500);
+    serial0_init();
+    sei();
+
+    lcd_clrscr();
+    lcd_goto(0x00);
+    lcd_puts("Waiting for data");
+    lcd_goto(0x40);
+    lcd_puts("                ");
+
+    char    lcd_line1[17] = {0};
+    char    lcd_line2[17] = {0};
+    char    serial_buf[40] = {0};
+    uint8_t rx[RX_SIZE];
+
+    while (1)
+    {
+        if (serial2_available())
+        {
+            serial2_get_data(rx, RX_SIZE);
+
+            uint8_t chk = rx[0] ^ rx[1] ^ rx[2] ^ 0xFF;
+
+            if (chk == rx[3] && rx[0] == CMD_BATT)
+            {
+                uint16_t batt = ((uint16_t)rx[1] << 8) | rx[2];
+
+                sprintf(lcd_line1, "Batt: %5u mV  ", batt);
+
+                if (batt < BATT_ALERT_MV)
+                {
+                    sprintf(lcd_line2, "Status: LOW BATT");
+                }
+                else
+                {
+                    sprintf(lcd_line2, "Status: OK      ");
+                }
+
+                lcd_goto(0x00);
+                lcd_puts(lcd_line1);
+                lcd_goto(0x40);
+                lcd_puts(lcd_line2);
+
+                sprintf(serial_buf, "Received: %u mV\n", batt);
+                serial0_print_string(serial_buf);
+            }
+            else
+            {
+                serial0_print_string("Bad packet\n");
+            }
+        }
+    }
+
+    return 0;
+}
