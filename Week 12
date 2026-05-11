@@ -1,0 +1,225 @@
+#include "Robot.h"
+
+void motor_pwm_init(void);
+void GPIO_init(void);
+void set_motors(int16_t lm, int16_t rm);
+
+int main(void)
+{
+    cli();
+    _delay_ms(20);
+    serial0_init();
+    serial2_init();
+    _delay_ms(20);
+    GPIO_init();
+    adc_init();
+    motor_pwm_init();
+    milliseconds_init();
+    char serial_string[60] = {0};
+    sei();
+
+    uint8_t command = 0;
+    uint8_t receivedData[4];
+    uint16_t last_send_ms = 0;
+
+    while(1)
+    {
+        uint16_t current_ms = milliseconds_now();
+
+        uint16_t adcVal = adc_read(1);
+        uint32_t pinMV = (uint32_t)adcVal * 5000 / 1023 * 2;
+
+        uint8_t lightval = (uint8_t)(pinMV * 253 / 10000);
+
+        if((current_ms - last_send_ms) >= 100)
+        {
+            sprintf(serial_string, "Sending: %3u\n", lightval);
+            serial0_print_string(serial_string);
+
+            uint8_t check = 0x10 ^ lightval ^ 0xFF;
+            serial2_write_bytes(3, 0x10, lightval, check);
+            last_send_ms = current_ms;
+        }
+
+        if(serial2_available())
+        {
+            serial2_get_data(receivedData, 4);
+
+            if(receivedData[3] == (receivedData[0] ^ receivedData[1] ^ receivedData[2] ^ 0xFF))
+            {
+                command = receivedData[0];
+            }
+            else
+            {
+                command = 0x00;
+            }
+
+            if(command == 0x02)
+            {
+                int16_t fc = receivedData[1];
+                int16_t rc = receivedData[2];
+
+                int16_t lm = fc + rc - 247;
+                int16_t rm = fc - rc - 3;
+
+                set_motors(lm, rm);
+
+                sprintf(serial_string, "lm: %3d rm: %3d\n", lm, rm);
+                serial0_print_string(serial_string);
+            }
+        }
+    }
+    return(0);
+}
+
+void set_motors(int16_t lm, int16_t rm)
+{
+    OCR1A = (int32_t)abs(lm) * 9999 / 126;
+    OCR1B = (int32_t)abs(rm) * 9999 / 126;
+
+    if(lm <= 0)
+    {
+        PORTA |= (1 << PA0);
+        PORTA &= ~(1 << PA1);
+    }
+    else
+    {
+        PORTA &= ~(1 << PA0);
+        PORTA |= (1 << PA1);
+    }
+
+    if(rm <= 0)
+    {
+        PORTA |= (1 << PA2);
+        PORTA &= ~(1 << PA3);
+    }
+    else
+    {
+        PORTA &= ~(1 << PA2);
+        PORTA |= (1 << PA3);
+    }
+}
+
+void motor_pwm_init(void)
+{
+    TCCR1A = (1 << COM1A1) | (1 << COM1B1) | (1 << WGM11);
+    TCCR1B = (1 << WGM13) | (1 << CS11);
+    ICR1 = 9999;
+    OCR1A = 0;
+    OCR1B = 0;
+}
+
+void GPIO_init(void)
+{
+    DDRA |= (1 << DDA0) | (1 << DDA1) | (1 << DDA2) | (1 << DDA3);
+    DDRB |= (1 << DDB5) | (1 << DDB6);
+    PORTB = 0;
+}
+
+#include "Controller.h"
+
+volatile bool buttonPressed = true;
+
+void GPIO_init(void)
+{
+    DDRA  = 0x00;
+    PORTA = 0x00;
+
+    DDRD  &= ~(1 << PD2);
+    PORTD |=  (1 << PD2);
+
+    EICRA |=  (1 << ISC21);
+    EICRA &= ~(1 << ISC20);
+
+    EIMSK |= (1 << INT2);
+}
+
+ISR(INT2_vect)
+{
+    buttonPressed = !buttonPressed;
+}
+
+int main(void)
+{
+    GPIO_init();
+    lcd_init();
+    _delay_ms(20);
+    adc_init();
+    _delay_ms(20);
+    serial2_init();
+    serial0_init();
+    milliseconds_init();
+    sei();
+
+    uint8_t databyte1 = 0;
+    uint8_t databyte2 = 0;
+    uint8_t databyte3 = 0;
+    uint8_t receivedData2[3];
+    uint16_t last_send_ms = 0;
+    char serial_string[60] = {0};
+    char lcd_string[33]    = {0};
+
+    lcd_clrscr();
+    lcd_home();
+    lcd_goto(0x00);
+    lcd_puts("init");
+    _delay_ms(3000);
+    lcd_clrscr();
+
+    while(1)
+    {
+        uint16_t current_ms = milliseconds_now();
+
+        databyte1 = 0x02;
+
+        uint8_t fc = (uint8_t)(((uint16_t)(adc_read(PA0) >> 2) * 253) / 255);
+        uint8_t rc = (uint8_t)(((uint16_t)(adc_read(PA1) >> 2) * 253) / 255);
+
+        databyte2 = fc;
+        databyte3 = rc;
+
+        if((current_ms - last_send_ms) >= 100)
+        {
+            uint8_t check = databyte1 ^ databyte2 ^ databyte3 ^ 0xFF;
+            serial2_write_bytes(4, databyte1, databyte2, databyte3, check);
+            last_send_ms = current_ms;
+        }
+
+        if(serial2_available())
+        {
+            serial2_get_data(receivedData2, 3);
+            lcd_goto(0x00);
+            if(receivedData2[2] == (receivedData2[0] ^ receivedData2[1] ^ 0xFF))
+            {
+                sprintf(serial_string, "Voltage:%5d", receivedData2[1]);
+                lcd_puts(serial_string);
+            }
+        }
+
+        lcd_goto(0x40);
+
+        int16_t fc_centred = (int16_t)fc - 126;
+        int16_t rc_centred = (int16_t)rc - 126;
+
+        if(abs(fc_centred) < 10 && abs(rc_centred) < 10)
+        {
+            lcd_puts("STOP     ");
+        }
+        else if(abs(rc_centred) > abs(fc_centred))
+        {
+            if(rc_centred > 0)
+                lcd_puts("RIGHT    ");
+            else
+                lcd_puts("LEFT     ");
+        }
+        else if(fc_centred > 0 && abs(rc_centred) < 10)
+        {
+            lcd_puts("REVERSE  ");
+        }
+        else
+        {
+            lcd_puts("FORWARD  ");
+        }
+    }
+    return(0);
+}
