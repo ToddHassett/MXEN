@@ -1,0 +1,159 @@
+/*
+ * WIRING:
+ *   LDR left  -> A2 (PF2)   voltage divider: 5V -> LDR -> junction -> 10k -> GND
+ *   LDR right -> A3 (PF3)   same circuit
+ *
+ * HOW TO TEST:
+ *   Point a flashing light (phone torch on strobe, or a function-generator
+ *   driven LED) at each LDR in turn.
+ *   Use a frequency between 2Hz and 30Hz.
+ *   Serial monitor should print the detected frequency within ~3 seconds
+ *   of the beacon being visible.
+ *   When no beacon is present, it prints "No beacon".
+ *
+ * EXPECTED OUTPUT (example at 10Hz beacon):
+ *   LDR0: 10 Hz   LDR1:  0 Hz
+ *
+ * EXPECTED OUTPUT (no beacon):
+ *   LDR0:  0 Hz   LDR1:  0 Hz   No beacon
+ */
+
+#include "Robot.h"
+#include <stdlib.h>
+
+/* LDR ADC threshold: above = bright, below = dark */
+#define LDR_THRESHOLD       512
+
+/* Ignore transitions faster than this (ms) */
+#define LDR_DEBOUNCE_MS     15
+
+/* Valid beacon period range for 2-30Hz */
+#define BEACON_PERIOD_MIN   33      /* ms  (30Hz) */
+#define BEACON_PERIOD_MAX   500     /* ms  (2Hz)  */
+
+/* Number of consistent period measurements before confirming frequency */
+#define FREQ_CONFIRM_COUNT  3
+
+/* Sensor state */
+uint8_t  ldr_state[2]     = {0, 0};
+uint32_t ldr_last_edge[2] = {0, 0};
+uint32_t ldr_period[2]    = {0, 0};
+uint8_t  ldr_confirm[2]   = {0, 0};
+uint8_t  ldr_freq_hz[2]   = {0, 0};
+
+void update_ldr(uint8_t idx, uint16_t adc_val, uint32_t now_ms)
+{
+    uint8_t new_state;
+
+    if (adc_val > LDR_THRESHOLD)
+    {
+        new_state = 1;
+    }
+    else
+    {
+        new_state = 0;
+    }
+
+    if (new_state == ldr_state[idx])
+    {
+        return;
+    }
+
+    uint32_t gap = now_ms - ldr_last_edge[idx];
+
+    if (gap < LDR_DEBOUNCE_MS)
+    {
+        return;
+    }
+
+    if (new_state == 1 && ldr_state[idx] == 0)
+    {
+        uint32_t period = now_ms - ldr_last_edge[idx];
+
+        if (period >= BEACON_PERIOD_MIN && period <= BEACON_PERIOD_MAX)
+        {
+            uint32_t diff = (uint32_t)abs((int32_t)period - (int32_t)ldr_period[idx]);
+
+            if (ldr_confirm[idx] > 0 && diff < 30)
+            {
+                ldr_confirm[idx]++;
+
+                if (ldr_confirm[idx] >= FREQ_CONFIRM_COUNT)
+                {
+                    ldr_freq_hz[idx] = (uint8_t)(1000 / ldr_period[idx]);
+                    ldr_confirm[idx] = FREQ_CONFIRM_COUNT;
+                }
+            }
+            else
+            {
+                ldr_confirm[idx] = 1;
+            }
+
+            ldr_period[idx] = period;
+        }
+        else
+        {
+            ldr_confirm[idx] = 0;
+            ldr_freq_hz[idx] = 0;
+            ldr_period[idx]  = 0;
+        }
+    }
+
+    ldr_last_edge[idx] = now_ms;
+    ldr_state[idx]     = new_state;
+}
+
+int main(void)
+{
+    /* PF2 and PF3 as ADC inputs, no pull-ups */
+    DDRF  &= ~((1 << DDF2) | (1 << DDF3));
+    PORTF &= ~((1 << PF2)  | (1 << PF3));
+
+    adc_init();
+    serial0_init();
+    milliseconds_init();
+    sei();
+
+    serial0_print_string("LDR frequency test ready\n");
+    serial0_print_string("Point a 2-30Hz flashing light at each LDR\n");
+
+    char     buf[60]         = {0};
+    uint32_t last_print_ms   = 0;
+    uint32_t last_sample_ms  = 0;
+
+    while (1)
+    {
+        uint32_t now = milliseconds_now();
+
+        /* Sample LDRs every 20ms */
+        if ((now - last_sample_ms) >= 20)
+        {
+            last_sample_ms = now;
+
+            uint16_t ldr0 = adc_read(2);   /* A2 = PF2, left  LDR */
+            uint16_t ldr1 = adc_read(3);   /* A3 = PF3, right LDR */
+
+            update_ldr(0, ldr0, now);
+            update_ldr(1, ldr1, now);
+        }
+
+        /* Print results every 500ms */
+        if ((now - last_print_ms) >= 500)
+        {
+            last_print_ms = now;
+
+            if (ldr_freq_hz[0] == 0 && ldr_freq_hz[1] == 0)
+            {
+                serial0_print_string("LDR0:  0 Hz   LDR1:  0 Hz   No beacon\n");
+            }
+            else
+            {
+                sprintf(buf, "LDR0: %2u Hz   LDR1: %2u Hz\n",
+                        ldr_freq_hz[0], ldr_freq_hz[1]);
+                serial0_print_string(buf);
+            }
+        }
+    }
+
+    return 0;
+}
