@@ -1,0 +1,176 @@
+/*
+ * test_servo_joystick.c
+ * MXEN2003 - Servo Controlled by Right Joystick Button (XBee)
+ *
+ * Flashes onto the ROVER board.
+ * Requires the CONTROLLER to be running test_servo_controller.c (below).
+ *
+ * Receives packets from the controller over XBee (Serial2).
+ * The right joystick button on the controller toggles the servo.
+ * Prints received servo state to Serial0 for verification.
+ *
+ * WIRING (rover board):
+ *   Servo signal -> D5  (PE3 / OC3A)
+ *   Servo VCC    -> 5V
+ *   Servo GND    -> GND
+ *   XBee DIN     <- TX2 (D16) via 2.2k+3.3k divider
+ *   XBee DOUT    -> RX2 (D17) direct
+ *
+ * PACKET FORMAT received (3 bytes):
+ *   [0] 0xA0        command byte
+ *   [1] grip        0=closed, 1=open
+ *   [2] checksum    [0]^[1]^0xFF
+ *
+ * EXPECTED RESULT:
+ *   Each right button press on the controller moves servo:
+ *     closed (0 deg, 1.0ms) <-> open (45 deg, 1.5ms)
+ *   Serial0 prints "Servo: OPEN" or "Servo: CLOSED" on each change.
+ */
+
+#include "Robot.h"
+
+#define SERVO_TOP       39999
+#define SERVO_CLOSED    2000
+#define SERVO_OPEN      3000
+
+#define CMD_SERVO       0xA0
+#define RX_SIZE         3
+
+int main(void)
+{
+    /* Servo output: PE3 (OC3A) */
+    DDRE |= (1 << DDE3);
+
+    /* Timer 3: Fast PWM, 50Hz */
+    TCCR3A = (1 << COM3A1) | (1 << WGM31);
+    TCCR3B = (1 << WGM33)  | (1 << WGM32) | (1 << CS31);
+    ICR3   = SERVO_TOP;
+    OCR3A  = SERVO_CLOSED;
+
+    serial0_init();
+    serial2_init();
+    _delay_ms(500);
+    milliseconds_init();
+    sei();
+
+    serial0_print_string("Servo joystick test ready\n");
+    serial0_print_string("Press right joystick button on controller\n");
+
+    uint8_t rx[RX_SIZE];
+
+    while (1)
+    {
+        if (serial2_available())
+        {
+            serial2_get_data(rx, RX_SIZE);
+
+            uint8_t chk = rx[0] ^ rx[1] ^ 0xFF;
+
+            if (chk == rx[2] && rx[0] == CMD_SERVO)
+            {
+                if (rx[1] == 1)
+                {
+                    OCR3A = SERVO_OPEN;
+                    serial0_print_string("Servo: OPEN (45 deg)\n");
+                }
+                else
+                {
+                    OCR3A = SERVO_CLOSED;
+                    serial0_print_string("Servo: CLOSED (0 deg)\n");
+                }
+            }
+            else
+            {
+                serial0_print_string("Bad packet received\n");
+            }
+        }
+    }
+
+    return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+/* =======================================================================
+ * test_servo_controller.c
+ * Flashes onto the CONTROLLER board for the servo joystick test.
+ *
+ * Right joystick button (INT4, PE4 / D2) toggles gripper state.
+ * Sends a 3-byte packet to the rover over XBee every time state changes.
+ *
+ * WIRING (controller board - do not rewire):
+ *   Right joystick button -> D2 (PE4 / INT4)  active-low, internal pull-up
+ *   XBee DIN  <- TX2 (D16) via 2.2k+3.3k divider
+ *   XBee DOUT -> RX2 (D17) direct
+ * ======================================================================= 
+ */
+#include "Controller.h"
+
+#define CMD_SERVO       0xA0
+#define TX_SIZE         3
+#define BTN_DEBOUNCE_MS 200
+
+volatile uint8_t  right_btn_flag    = 0;
+volatile uint32_t right_btn_last_ms = 0;
+volatile uint8_t  gripper_open      = 0;
+
+ISR(INT4_vect)
+{
+    uint32_t now = milliseconds_now();
+    if ((now - right_btn_last_ms) > BTN_DEBOUNCE_MS)
+    {
+        right_btn_flag    = 1;
+        right_btn_last_ms = now;
+    }
+}
+
+int main(void)
+{
+    DDRE  &= ~(1 << PE4);
+    PORTE |=  (1 << PE4);
+
+    EICRB |=  (1 << ISC41);
+    EICRB &= ~(1 << ISC40);
+    EIMSK |=  (1 << INT4);
+
+    milliseconds_init();
+    serial2_init();
+    _delay_ms(500);
+    serial0_init();
+    sei();
+
+    serial0_print_string("Servo controller test ready\n");
+
+    while (1)
+    {
+        if (right_btn_flag)
+        {
+            right_btn_flag = 0;
+
+            if (gripper_open == 0)
+            {
+                gripper_open = 1;
+                serial0_print_string("Sending: OPEN\n");
+            }
+            else
+            {
+                gripper_open = 0;
+                serial0_print_string("Sending: CLOSED\n");
+            }
+
+            uint8_t chk = CMD_SERVO ^ gripper_open ^ 0xFF;
+            serial2_write_bytes(TX_SIZE, CMD_SERVO, gripper_open, chk);
+        }
+    }
+
+    return 0;
+}
