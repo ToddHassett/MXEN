@@ -37,7 +37,7 @@
  *
  * BATTERY VOLTAGE MONITOR:
  *   Divider output   -> A1   (PF1)
- *   R1=10k (12V to junction), R2=3.3k (junction to GND)
+ *   R1=6.8k (8.4V to junction), R2=6.8k (junction to GND)
  *
  * XBEE:
  *   XBee DIN         <- TX2 (D16/PH1) via 2.2k+3.3k divider (5V->3.3V)
@@ -113,9 +113,9 @@
 
 #define BATT_ALERT_MV       7000
 
-/* Battery voltage divider scale: (R1+R2)/R2 = (10k+3.3k)/3.3k */
-#define VDIV_NUM            133
-#define VDIV_DEN            33
+/* Battery voltage divider scale
+#define VDIV_NUM            2
+#define VDIV_DEN            1
 
 /* LDR beacon detection
  * A beacon flashes at 2-30Hz. We sample every 20ms (50Hz) which is
