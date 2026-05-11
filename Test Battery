@@ -4,11 +4,6 @@
  *   R2 = 6.8k : connects junction to GND
  *   Junction wire -> A1 (PF1)
  *
- * SCALE FACTOR:
- *   Battery voltage = ADC_pin_voltage * (R1 + R2) / R2
- *                   = ADC_pin_voltage * 13.3 / 3.3
- *                   = ADC_pin_voltage * 133 / 33
- *
  * HOW TO TEST:
  *   Open serial monitor at 9600 baud.
  *   With 12V connected, output should read approximately 12000mV.
