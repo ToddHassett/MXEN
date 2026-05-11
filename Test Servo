@@ -1,0 +1,90 @@
+/*
+ * WIRING:
+ *   Servo signal -> D5  (PE3 / OC3A)
+ *   Servo VCC    -> 5V
+ *   Servo GND    -> GND
+ *   Test button  -> D7  (PH4), other leg to GND (uses internal pull-up)
+ *
+ * EXPECTED RESULT:
+ *   On startup servo moves to closed (0 deg).
+ *   Each button press toggles to open (45 deg) and back.
+ *   Serial0 prints "Servo: OPEN" or "Servo: CLOSED" on each press.
+ */
+
+#include "Robot.h"
+
+/* Timer 3 Fast PWM, ICR3=39999, prescaler /8, 16MHz = 50Hz
+ * Tick = 0.5us
+ * 1.0ms = 2000 ticks = 0 deg   (closed)
+ * 1.5ms = 3000 ticks = 45 deg  (open)
+ */
+#define SERVO_TOP       39999
+#define SERVO_CLOSED    2000
+#define SERVO_OPEN      3000
+
+#define BTN_DEBOUNCE_MS 200
+
+volatile uint8_t  btn_flag    = 0;
+volatile uint32_t btn_last_ms = 0;
+
+/* Button on PH4 (D7), INT? - PH4 has no dedicated INT line so we poll */
+
+int main(void)
+{
+    /* Servo output: PE3 (OC3A) */
+    DDRE |= (1 << DDE3);
+
+    /* Button input: PH4 (D7) with pull-up */
+    DDRH  &= ~(1 << PH4);
+    PORTH |=  (1 << PH4);
+
+    /* Timer 3: Fast PWM, TOP = ICR3 */
+    TCCR3A = (1 << COM3A1) | (1 << WGM31);
+    TCCR3B = (1 << WGM33)  | (1 << WGM32) | (1 << CS31);
+    ICR3   = SERVO_TOP;
+    OCR3A  = SERVO_CLOSED;
+
+    serial0_init();
+    milliseconds_init();
+    sei();
+
+    serial0_print_string("Servo test ready\n");
+    serial0_print_string("Press button on D7 to toggle servo\n");
+
+    uint8_t  servo_open    = 0;
+    uint8_t  last_btn      = 1;   /* pull-up: unpressed = 1 */
+    uint32_t last_press_ms = 0;
+
+    while (1)
+    {
+        uint32_t now      = milliseconds_now();
+        uint8_t  btn_now  = (PINH & (1 << PH4)) ? 1 : 0;
+
+        /* Detect falling edge (press) with debounce */
+        if (btn_now == 0 && last_btn == 1)
+        {
+            if ((now - last_press_ms) > BTN_DEBOUNCE_MS)
+            {
+                last_press_ms = now;
+
+                if (servo_open == 0)
+                {
+                    servo_open = 1;
+                    OCR3A = SERVO_OPEN;
+                    serial0_print_string("Servo: OPEN (45 deg)\n");
+                }
+                else
+                {
+                    servo_open = 0;
+                    OCR3A = SERVO_CLOSED;
+                    serial0_print_string("Servo: CLOSED (0 deg)\n");
+                }
+            }
+        }
+
+        last_btn = btn_now;
+        _delay_ms(5);
+    }
+
+    return 0;
+}
