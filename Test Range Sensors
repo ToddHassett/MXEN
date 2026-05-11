@@ -1,0 +1,103 @@
+/*
+ * WIRING (matches main Robot.c):
+ *   Front TRIG -> D30 (PC7)   Front ECHO -> D19 (PD2)
+ *   Left  TRIG -> D31 (PC6)   Left  ECHO -> D18 (PD3)
+ *   Right TRIG -> D32 (PC5)   Right ECHO -> D33 (PC4)
+ *   Each sensor: VCC=5V, GND=GND
+ *
+ * HOW TO TEST:
+ *   Open serial monitor at 9600 baud.
+ *   Move a flat object toward each sensor in turn.
+ *   Distance should decrease smoothly and read 999 when nothing is in range.
+ *
+ * EXPECTED OUTPUT:
+ *   Front: 034cm   Left: 082cm   Right: 999cm
+ */
+
+#include "Robot.h"
+#include <stdlib.h>
+
+uint16_t range_cm(volatile uint8_t *trig_port, uint8_t trig_pin,
+                  volatile uint8_t *echo_pin_reg, uint8_t echo_pin)
+{
+    /* Send 10us trigger pulse */
+    *trig_port |=  (1 << trig_pin);
+    _delay_us(10);
+    *trig_port &= ~(1 << trig_pin);
+
+    /* Wait for echo to go high, timeout after ~5ms */
+    uint16_t t = 0;
+    while (!(*echo_pin_reg & (1 << echo_pin)))
+    {
+        _delay_us(1);
+        t++;
+        if (t > 5000)
+        {
+            return 999;
+        }
+    }
+
+    /* Count microseconds while echo is high */
+    uint16_t count = 0;
+    while (*echo_pin_reg & (1 << echo_pin))
+    {
+        _delay_us(1);
+        count++;
+        if (count > 25000)
+        {
+            return 999;
+        }
+    }
+
+    /* 58us per cm (340 m/s round trip) */
+    return count / 58;
+}
+
+int main(void)
+{
+    /* TRIG pins as outputs */
+    DDRC |= (1 << DDC5) | (1 << DDC6) | (1 << DDC7);
+    PORTC &= ~((1 << PC5) | (1 << PC6) | (1 << PC7));
+
+    /* ECHO pins as inputs, no pull-ups */
+    /* PC4 (D33): right echo */
+    DDRC  &= ~(1 << DDC4);
+    PORTC &= ~(1 << PC4);
+
+    /* PD2 (D19): front echo */
+    DDRD  &= ~(1 << DDD2);
+    PORTD &= ~(1 << PD2);
+
+    /* PD3 (D18): left echo */
+    DDRD  &= ~(1 << DDD3);
+    PORTD &= ~(1 << PD3);
+
+    serial0_init();
+    milliseconds_init();
+    sei();
+
+    serial0_print_string("Range sensor test ready\n");
+
+    char     buf[60]        = {0};
+    uint32_t last_print_ms  = 0;
+
+    while (1)
+    {
+        uint32_t now = milliseconds_now();
+
+        if ((now - last_print_ms) >= 200)
+        {
+            last_print_ms = now;
+
+            uint16_t front = range_cm(&PORTC, 7, &PINC, 4);
+            uint16_t left  = range_cm(&PORTC, 6, &PIND, 3);
+            uint16_t right = range_cm(&PORTC, 5, &PIND, 2);
+
+            sprintf(buf, "Front: %3ucm   Left: %3ucm   Right: %3ucm\n",
+                    front, left, right);
+            serial0_print_string(buf);
+        }
+    }
+
+    return 0;
+}
