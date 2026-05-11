@@ -10,7 +10,7 @@
  *   Adjust VDIV_NUM/VDIV_DEN if your resistors differ from 10k/3.3k.
  *
  * EXPECTED OUTPUT (12V supply):
- *   Battery: 11850 mV   OK
+ *   Battery: 8200 mV   OK
  *
  * EXPECTED OUTPUT (below 7V):
  *   Battery:  6700 mV   LOW BATT
