@@ -18,7 +18,6 @@
 
 #include "Robot.h"
 
-/* Voltage divider: (R1+R2)/R2 = (10000+3300)/3300 = 133/33 */
 #define VDIV_NUM    2
 #define VDIV_DEN    1
 
