@@ -6,7 +6,7 @@
  *
  * HOW TO TEST:
  *   Open serial monitor at 9600 baud.
- *   With 12V connected, output should read approximately 12000mV.
+ *   With 8.4V connected, output should read approximately 8400mV.
  *   Adjust VDIV_NUM/VDIV_DEN if your resistors differ from 10k/3.3k.
  *
  * EXPECTED OUTPUT (12V supply):
