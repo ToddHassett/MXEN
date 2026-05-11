@@ -1,0 +1,80 @@
+/*
+ * WIRING:
+ *   R1 = 6.8k  : connects 12V battery positive to the junction
+ *   R2 = 6.8k : connects junction to GND
+ *   Junction wire -> A1 (PF1)
+ *
+ * SCALE FACTOR:
+ *   Battery voltage = ADC_pin_voltage * (R1 + R2) / R2
+ *                   = ADC_pin_voltage * 13.3 / 3.3
+ *                   = ADC_pin_voltage * 133 / 33
+ *
+ * HOW TO TEST:
+ *   Open serial monitor at 9600 baud.
+ *   With 12V connected, output should read approximately 12000mV.
+ *   Adjust VDIV_NUM/VDIV_DEN if your resistors differ from 10k/3.3k.
+ *
+ * EXPECTED OUTPUT (12V supply):
+ *   Battery: 11850 mV   OK
+ *
+ * EXPECTED OUTPUT (below 7V):
+ *   Battery:  6700 mV   LOW BATT
+ */
+
+#include "Robot.h"
+
+/* Voltage divider: (R1+R2)/R2 = (10000+3300)/3300 = 133/33 */
+#define VDIV_NUM    2
+#define VDIV_DEN    1
+
+/* Alert threshold in millivolts */
+#define BATT_ALERT_MV   7000
+
+int main(void)
+{
+    /* PF1 as ADC input, no pull-up */
+    DDRF  &= ~(1 << DDF1);
+    PORTF &= ~(1 << PF1);
+
+    adc_init();
+    serial0_init();
+    milliseconds_init();
+    sei();
+
+    serial0_print_string("Battery voltage test ready\n");
+
+    char     buf[60]       = {0};
+    uint32_t last_print_ms = 0;
+
+    while (1)
+    {
+        uint32_t now = milliseconds_now();
+
+        if ((now - last_print_ms) >= 500)
+        {
+            last_print_ms = now;
+
+            /* Read raw ADC value on PF1 */
+            uint16_t raw = adc_read(1);
+
+            /* Convert to millivolts at the ADC pin (5V reference, 10-bit) */
+            uint32_t pin_mv = (uint32_t)raw * 5000 / 1023;
+
+            /* Scale back up through the voltage divider */
+            uint16_t batt_mv = (uint16_t)((uint32_t)pin_mv * VDIV_NUM / VDIV_DEN);
+
+            if (batt_mv < BATT_ALERT_MV)
+            {
+                sprintf(buf, "Battery: %5u mV   LOW BATT\n", batt_mv);
+            }
+            else
+            {
+                sprintf(buf, "Battery: %5u mV   OK\n", batt_mv);
+            }
+
+            serial0_print_string(buf);
+        }
+    }
+
+    return 0;
+}
