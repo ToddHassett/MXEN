@@ -1,0 +1,912 @@
+/*
+ * Robot.c
+ * MXEN2003 Rover Project - Rover Arduino Mega
+ *
+ * =====================================================================
+ * ROVER PIN CONNECTIONS
+ * =====================================================================
+ *
+ * MOTORS (L293B H-bridge):
+ *   Left  motor PWM  -> D11  (PB5 / OC1A)
+ *   Right motor PWM  -> D12  (PB6 / OC1B)
+ *   Left  motor IN1  -> D22  (PA0)
+ *   Left  motor IN2  -> D23  (PA1)
+ *   Right motor IN3  -> D24  (PA2)
+ *   Right motor IN4  -> D25  (PA3)
+ *
+ * SERVO (gripper):
+ *   Signal           -> D5   (PE3 / OC3A)
+ *   VCC              -> 5V
+ *   GND              -> GND
+ *   0 deg  = closed  = ~1.0ms pulse
+ *   45 deg = open    = ~1.5ms pulse
+ *
+ * RANGE SENSORS (HC-SR04, x3):
+ *   Front TRIG       -> D30  (PC7)   output
+ *   Front ECHO       -> D19  (PD2)   input
+ *   Left  TRIG       -> D31  (PC6)   output
+ *   Left  ECHO       -> D18  (PD3)   input
+ *   Right TRIG       -> D32  (PC5)   output
+ *   Right ECHO       -> D33  (PC4)   input
+ *   Each: VCC=5V, GND=GND
+ *
+ * PHOTORESISTORS (LDR, beacon frequency detection):
+ *   LDR left  signal -> A2   (PF2)   voltage divider: 5V-LDR-junction-10k-GND
+ *   LDR right signal -> A3   (PF3)   same divider circuit
+ *   Both face FORWARD, mounted left and right side of rover
+ *
+ * BATTERY VOLTAGE MONITOR:
+ *   Divider output   -> A1   (PF1)
+ *   R1=10k (12V to junction), R2=3.3k (junction to GND)
+ *
+ * XBEE:
+ *   XBee DIN         <- TX2 (D16/PH1) via 2.2k+3.3k divider (5V->3.3V)
+ *   XBee DOUT        -> RX2 (D17/PH0) direct
+ *   XBee VCC         -> 3.3V
+ *   XBee GND         -> GND
+ *
+ * =====================================================================
+ * AUTONOMOUS BEHAVIOUR
+ * =====================================================================
+ *   When MODE_AUTONOMOUS is received:
+ *     - Rover wall-follows through the maze using 3 range sensors
+ *     - Both LDRs are continuously sampled to detect beacon flashes
+ *     - If a beacon is detected (LDR transition frequency 2-30Hz),
+ *       rover switches to BEACON_APPROACH sub-mode:
+ *         * Steers toward the side with the stronger LDR signal
+ *         * Stops when front sensor reads < 10cm
+ *         * Measures and reports frequency over XBee
+ *     - Manual override: controller sends MODE_MANUAL to exit at any time
+ *
+ * =====================================================================
+ * SERVO POSITIONS
+ * =====================================================================
+ *   Closed = 0 deg  = 1.0ms pulse = OCR3A = 2000 (ICR3=39999, /8 prescaler)
+ *   Open   = 45 deg = 1.5ms pulse = OCR3A = 3000
+ *   (Standard 0 deg = 1ms, 180 deg = 2ms; 45 deg = 1.5ms)
+ *
+ * =====================================================================
+ * PACKET FORMAT  Controller -> Robot  (6 bytes)
+ * =====================================================================
+ *   [0] 0x02  command
+ *   [1] fc    forward component 0-253
+ *   [2] rc    rotation component 0-253
+ *   [3] grip  0=closed, 1=open
+ *   [4] mode  0=manual, 1=autonomous
+ *   [5] chk   [0]^[1]^[2]^[3]^[4]^0xFF
+ *
+ * =====================================================================
+ * PACKET FORMAT  Robot -> Controller  (6 bytes)
+ * =====================================================================
+ *   [0] 0x01    reply
+ *   [1] batt_h  battery mV high byte
+ *   [2] batt_l  battery mV low byte
+ *   [3] freq    beacon Hz (0 = not detected)
+ *   [4] 0x00    reserved
+ *   [5] chk     [0]^[1]^[2]^[3]^[4]^0xFF
+ */
+
+#include "Robot.h"
+#include <stdlib.h>
+
+#define PWM_TOP             9999
+
+#define JOYSTICK_CENTRE     126
+#define DEAD_ZONE           10
+
+
+#define SERVO_TOP           39999
+#define SERVO_CLOSED        2000
+#define SERVO_OPEN          3000
+
+#define STOP_DIST_CM        10      /* Stop at beacon when closer than this */
+#define WALL_FRONT_CM       20      /* Turn if front is blocked */
+#define WALL_SIDE_CM        15      /* Too close to side wall */
+#define OPEN_SIDE_CM        30      /* Side is clear */
+
+/* Autonomous drive speeds (-253 to +253 scale) */
+#define AUTO_SPEED          80
+#define TURN_SPEED          70
+#define BEACON_SPEED        60
+
+#define TURN_DURATION_MS    400
+
+#define BATT_ALERT_MV       7000
+
+/* Battery voltage divider scale: (R1+R2)/R2 = (10k+3.3k)/3.3k */
+#define VDIV_NUM            133
+#define VDIV_DEN            33
+
+/* LDR beacon detection
+ * A beacon flashes at 2-30Hz. We sample every 20ms (50Hz) which is
+ * fast enough to catch any flash edge in that range.
+ * Valid period range for 2-30Hz: 33ms - 500ms
+ */
+#define LDR_THRESHOLD       512         /* ADC mid-point */
+#define LDR_DEBOUNCE_MS     15          /* min ms between edge events */
+#define BEACON_PERIOD_MIN   33          /* ms: max 30Hz */
+#define BEACON_PERIOD_MAX   500         /* ms: min 2Hz  */
+
+/* How many consistent period measurements before we trust the frequency */
+#define FREQ_CONFIRM_COUNT  3
+
+#define CMD_DRIVE           0x02
+#define CMD_REPLY           0x01
+#define TX_SIZE             6
+#define RX_SIZE             6
+
+#define MODE_MANUAL         0
+#define MODE_AUTONOMOUS     1
+
+typedef enum
+{
+    AUTO_WALL_FOLLOW,       /* navigating the maze */
+    AUTO_BEACON_APPROACH,   /* steering toward a detected beacon */
+    AUTO_AT_BEACON          /* stopped at beacon, reading frequency */
+} AutoSubMode;
+
+volatile uint8_t current_mode = MODE_MANUAL;
+volatile uint8_t gripper_open = 0;
+
+/* LDR state for each sensor (index 0 = left, index 1 = right) */
+volatile uint8_t  ldr_state[2]     = {0, 0};
+volatile uint32_t ldr_last_edge[2] = {0, 0};
+volatile uint32_t ldr_period[2]    = {0, 0};   /* last measured full period ms */
+volatile uint8_t  ldr_confirm[2]   = {0, 0};   /* consecutive matching periods */
+volatile uint8_t  ldr_freq_hz[2]   = {0, 0};   /* confirmed frequency, 0 = none */
+
+void     GPIO_init(void);
+void     motor_pwm_init(void);
+void     servo_init(void);
+void     set_motors(int16_t lm, int16_t rm);
+void     set_servo(uint8_t open);
+uint16_t range_cm(volatile uint8_t *trig_port, uint8_t trig_pin, volatile uint8_t *echo_pin_reg, uint8_t echo_pin);
+uint16_t battery_mv(void);
+void     update_ldr(uint8_t idx, uint16_t adc_val, uint32_t now_ms);
+void     run_autonomous(uint16_t front, uint16_t left, uint16_t right);
+void     send_telemetry(uint16_t batt, uint8_t freq);
+
+int main(void)
+{
+    cli();
+    _delay_ms(20);
+    serial0_init();
+    serial2_init();
+    _delay_ms(500);
+    GPIO_init();
+    adc_init();
+    motor_pwm_init();
+    servo_init();
+    milliseconds_init();
+    sei();
+
+    set_servo(0);
+    set_motors(0, 0);
+
+    serial0_print_string("Robot ready\n");
+
+    char     dbg[80]        = {0};
+    uint8_t  rx[RX_SIZE];
+    uint16_t last_sensor_ms = 0;
+    uint16_t last_telem_ms  = 0;
+
+    uint16_t front_cm = 999;
+    uint16_t left_cm  = 999;
+    uint16_t right_cm = 999;
+    uint16_t batt     = 0;
+
+    while (1)
+    {
+        uint32_t now = milliseconds_now();
+
+        if (serial2_available())
+        {
+            serial2_get_data(rx, RX_SIZE);
+
+            uint8_t chk = rx[0] ^ rx[1] ^ rx[2] ^ rx[3] ^ rx[4] ^ 0xFF;
+
+            if (chk == rx[5] && rx[0] == CMD_DRIVE)
+            {
+                uint8_t fc   = rx[1];
+                uint8_t rc   = rx[2];
+                uint8_t grip = rx[3];
+                uint8_t mode = rx[4];
+
+                current_mode = mode;
+
+                if (grip != gripper_open)
+                {
+                    gripper_open = grip;
+                    set_servo(gripper_open);
+                }
+
+                if (current_mode == MODE_MANUAL)
+                {
+                    int16_t lm = (int16_t)fc + (int16_t)rc - 253;
+                    int16_t rm = (int16_t)fc - (int16_t)rc;
+
+                    int16_t fc_c = (int16_t)fc - JOYSTICK_CENTRE;
+                    int16_t rc_c = (int16_t)rc - JOYSTICK_CENTRE;
+
+                    if (abs(fc_c) < DEAD_ZONE && abs(rc_c) < DEAD_ZONE)
+                    {
+                        lm = 0;
+                        rm = 0;
+                    }
+
+                    set_motors(lm, rm);
+                }
+            }
+            else
+            {
+                if (current_mode == MODE_MANUAL)
+                {
+                    set_motors(0, 0);
+                }
+            }
+        }
+
+        if ((uint16_t)(now - last_sensor_ms) >= 20)
+        {
+            last_sensor_ms = (uint16_t)now;
+
+            /*
+             * range_cm(trig_port, trig_pin, echo_pin_register, echo_pin)
+             *
+             * Front TRIG = PC7 (D30), Front ECHO = PD2 (D19) -> read PIND bit 2
+             * Left  TRIG = PC6 (D31), Left  ECHO = PD3 (D18) -> read PIND bit 3
+             * Right TRIG = PC5 (D32), Right ECHO = PC4 (D33) -> read PINC bit 4
+             */
+            front_cm = range_cm(&PORTC, 7, &PINC, 4);
+            left_cm  = range_cm(&PORTC, 6, &PIND, 3);
+            right_cm = range_cm(&PORTC, 5, &PIND, 2);
+
+            /* Battery voltage */
+            uint16_t raw    = adc_read(1);   /* A1 = PF1 */
+            uint32_t pin_mv = (uint32_t)raw * 5000 / 1023;
+            batt = (uint16_t)((uint32_t)pin_mv * VDIV_NUM / VDIV_DEN);
+
+            /* LDR readings */
+            uint16_t ldr0 = adc_read(2);     /* A2 = PF2, left LDR  */
+            uint16_t ldr1 = adc_read(3);     /* A3 = PF3, right LDR */
+            update_ldr(0, ldr0, now);
+            update_ldr(1, ldr1, now);
+        }
+
+        if (current_mode == MODE_AUTONOMOUS)
+        {
+            run_autonomous(front_cm, left_cm, right_cm);
+        }
+
+        if ((uint16_t)(now - last_telem_ms) >= 100)
+        {
+            last_telem_ms = (uint16_t)now;
+
+            uint8_t freq = 0;
+
+            if (ldr_freq_hz[0] > 0)
+            {
+                freq = ldr_freq_hz[0];
+            }
+            else if (ldr_freq_hz[1] > 0)
+            {
+                freq = ldr_freq_hz[1];
+            }
+
+            send_telemetry(batt, freq);
+
+            sprintf(dbg, "F:%3u L:%3u R:%3u B:%4umV LDR:%2u/%2u Hz\n", front_cm, left_cm, right_cm, batt, ldr_freq_hz[0], ldr_freq_hz[1]);
+            serial0_print_string(dbg);
+        }
+    }
+
+    return 0;
+}
+
+void set_motors(int16_t lm, int16_t rm)
+{
+    /* Map magnitude 0-253 to PWM compare value 0-9999 */
+    OCR1A = (uint16_t)((int32_t)abs(lm) * PWM_TOP / 253);
+    OCR1B = (uint16_t)((int32_t)abs(rm) * PWM_TOP / 253);
+
+    if (lm >= 0)
+    {
+        PORTA |=  (1 << PA0);
+        PORTA &= ~(1 << PA1);
+    }
+    else
+    {
+        PORTA &= ~(1 << PA0);
+        PORTA |=  (1 << PA1);
+    }
+
+    if (rm >= 0)
+    {
+        PORTA |=  (1 << PA2);
+        PORTA &= ~(1 << PA3);
+    }
+    else
+    {
+        PORTA &= ~(1 << PA2);
+        PORTA |=  (1 << PA3);
+    }
+}
+
+void set_servo(uint8_t open)
+{
+    if (open == 1)
+    {
+        OCR3A = SERVO_OPEN;
+    }
+    else
+    {
+        OCR3A = SERVO_CLOSED;
+    }
+}
+
+uint16_t range_cm(volatile uint8_t *trig_port, uint8_t trig_pin, volatile uint8_t *echo_pin_reg, uint8_t echo_pin)
+{
+    *trig_port |=  (1 << trig_pin);
+    _delay_us(10);
+    *trig_port &= ~(1 << trig_pin);
+
+    uint16_t t = 0;
+    while (!(*echo_pin_reg & (1 << echo_pin)))
+    {
+        _delay_us(1);
+        t++;
+        if (t > 5000)
+        {
+            return 999;
+        }
+    }
+
+    uint16_t count = 0;
+    while (*echo_pin_reg & (1 << echo_pin))
+    {
+        _delay_us(1);
+        count++;
+        if (count > 25000)
+        {
+            return 999;
+        }
+    }
+
+    return count / 58;
+}
+
+uint16_t battery_mv(void)
+{
+    uint16_t raw    = adc_read(1);
+    uint32_t pin_mv = (uint32_t)raw * 5000 / 1023;
+    return (uint16_t)((uint32_t)pin_mv * VDIV_NUM / VDIV_DEN);
+}
+
+void update_ldr(uint8_t idx, uint16_t adc_val, uint32_t now_ms)
+{
+    uint8_t new_state;
+
+    if (adc_val > LDR_THRESHOLD)
+    {
+        new_state = 1;
+    }
+    else
+    {
+        new_state = 0;
+    }
+
+    if (new_state == ldr_state[idx])
+    {
+        return;
+    }
+
+    uint32_t gap = now_ms - ldr_last_edge[idx];
+
+    if (gap < LDR_DEBOUNCE_MS)
+    {
+        return;   /* too fast, ignore */
+    }
+
+    if (new_state == 1 && ldr_state[idx] == 0)
+    {
+        uint32_t period = now_ms - ldr_last_edge[idx];
+
+        if (period >= BEACON_PERIOD_MIN && period <= BEACON_PERIOD_MAX)
+        {
+            uint32_t diff = (uint32_t)abs((int32_t)period - (int32_t)ldr_period[idx]);
+
+            if (ldr_confirm[idx] > 0 && diff < 30)
+            {
+                ldr_confirm[idx]++;
+
+                if (ldr_confirm[idx] >= FREQ_CONFIRM_COUNT)
+                {
+                    ldr_freq_hz[idx] = (uint8_t)(1000 / ldr_period[idx]);
+                    ldr_confirm[idx] = FREQ_CONFIRM_COUNT;
+                }
+            }
+            else
+            {
+                ldr_confirm[idx] = 1;
+            }
+
+            ldr_period[idx] = period;
+        }
+        else
+        {
+            ldr_confirm[idx] = 0;
+            ldr_freq_hz[idx] = 0;
+            ldr_period[idx]  = 0;
+        }
+    }
+
+    ldr_last_edge[idx] = now_ms;
+    ldr_state[idx]     = new_state;
+}
+
+void run_autonomous(uint16_t front, uint16_t left, uint16_t right)
+{
+    static AutoSubMode sub      = AUTO_WALL_FOLLOW;
+    static uint32_t turn_start  = 0;
+    static uint8_t  turning     = 0;
+    static uint8_t  turn_dir    = 0;
+
+    uint32_t now = milliseconds_now();
+
+    uint8_t beacon_detected = 0;
+
+    if (ldr_freq_hz[0] > 0 || ldr_freq_hz[1] > 0)
+    {
+        beacon_detected = 1;
+    }
+
+    if (sub == AUTO_AT_BEACON)
+    {
+        set_motors(0, 0);
+        return;
+    }
+
+    if (sub == AUTO_BEACON_APPROACH)
+    {
+        if (front < STOP_DIST_CM)
+        {
+            /* Arrived at beacon */
+            set_motors(0, 0);
+            sub = AUTO_AT_BEACON;
+            return;
+        }
+
+        /* Compare raw LDR ADC values to determine steering direction */
+        uint16_t ldr_l = adc_read(2);   /* A2 = PF2, left LDR  */
+        uint16_t ldr_r = adc_read(3);   /* A3 = PF3, right LDR */
+        int16_t  diff  = (int16_t)ldr_l - (int16_t)ldr_r;
+
+        if (diff > 50)
+        {
+            /* Left is brighter: turn left */
+            set_motors(-BEACON_SPEED, BEACON_SPEED);
+        }
+        else if (diff < -50)
+        {
+            /* Right is brighter: turn right */
+            set_motors(BEACON_SPEED, -BEACON_SPEED);
+        }
+        else
+        {
+            /* Even: drive straight toward the beacon */
+            set_motors(BEACON_SPEED, BEACON_SPEED);
+        }
+
+        /* Safety: if beacon is no longer seen, return to wall-follow */
+        if (beacon_detected == 0)
+        {
+            sub            = AUTO_WALL_FOLLOW;
+            ldr_freq_hz[0] = 0;
+            ldr_freq_hz[1] = 0;
+        }
+
+        return;
+    }
+
+    if (beacon_detected == 1)
+    {
+        sub     = AUTO_BEACON_APPROACH;
+        turning = 0;
+        return;
+    }
+
+    /* Continue current turn if one is active */
+    if (turning == 1)
+    {
+        if ((uint32_t)(now - turn_start) >= TURN_DURATION_MS)
+        {
+            turning = 0;
+        }
+        else
+        {
+            if (turn_dir == 0)
+            {
+                set_motors(-TURN_SPEED, TURN_SPEED);    /* turn left  */
+            }
+            else
+            {
+                set_motors(TURN_SPEED, -TURN_SPEED);    /* turn right */
+            }
+            return;
+        }
+    }
+
+    /* Wall-follow decision */
+    if (front < WALL_FRONT_CM)
+    {
+        /* Blocked ahead: turn toward the more open side */
+        turning    = 1;
+        turn_start = now;
+
+        if (left > right)
+        {
+            turn_dir = 0;   /* left is more open: turn left */
+        }
+        else
+        {
+            turn_dir = 1;   /* right is more open: turn right */
+        }
+    }
+    else if (left > OPEN_SIDE_CM)
+    {
+        /* Left wall has gone: turn left to stay near it */
+        turning    = 1;
+        turn_start = now;
+        turn_dir   = 0;
+    }
+    else
+    {
+        /* Path is clear ahead: drive forward */
+        set_motors(AUTO_SPEED, AUTO_SPEED);
+    }
+}
+
+void send_telemetry(uint16_t batt, uint8_t freq)
+{
+    uint8_t batt_h = (uint8_t)(batt >> 8);
+    uint8_t batt_l = (uint8_t)(batt & 0xFF);
+    uint8_t chk    = CMD_REPLY ^ batt_h ^ batt_l ^ freq ^ 0x00 ^ 0xFF;
+    serial2_write_bytes(TX_SIZE, CMD_REPLY, batt_h, batt_l, freq, 0x00, chk);
+}
+
+void GPIO_init(void)
+{
+    DDRA |= (1 << DDA0) | (1 << DDA1) | (1 << DDA2) | (1 << DDA3);
+    PORTA = 0x00;
+
+    DDRB |= (1 << DDB5) | (1 << DDB6);
+
+    DDRC |= (1 << DDC5) | (1 << DDC6) | (1 << DDC7);
+
+    DDRC  &= ~(1 << DDC4);
+    PORTC &= ~((1 << PC5) | (1 << PC6) | (1 << PC7) | (1 << PC4));
+
+    DDRD  &= ~((1 << DDD2) | (1 << DDD3));
+    PORTD &= ~((1 << PD2)  | (1 << PD3));
+
+    DDRE |= (1 << DDE3);
+
+    DDRF  &= ~((1 << DDF1) | (1 << DDF2) | (1 << DDF3));
+    PORTF &= ~((1 << PF1)  | (1 << PF2)  | (1 << PF3));
+}
+
+void motor_pwm_init(void)
+{
+    TCCR1A = (1 << COM1A1) | (1 << COM1B1) | (1 << WGM11);
+    TCCR1B = (1 << WGM13)  | (1 << CS11);
+    ICR1   = PWM_TOP;
+    OCR1A  = 0;
+    OCR1B  = 0;
+}
+
+void servo_init(void)
+{
+    TCCR3A = (1 << COM3A1) | (1 << WGM31);
+    TCCR3B = (1 << WGM33)  | (1 << WGM32) | (1 << CS31);
+    ICR3   = SERVO_TOP;
+    OCR3A  = SERVO_CLOSED;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+ * Controller.c
+ * MXEN2003 Rover Project - Controller Arduino Mega
+ *
+ * =====================================================================
+ * CONTROLLER PIN CONNECTIONS
+ * =====================================================================
+ *
+ * Already wired on the preconfigured controller board:
+ *   Left joystick  Y-axis (forward/back) -> A0 (PF0)
+ *   Left joystick  X-axis (left/right)   -> A1 (PF1)
+ *   XBee DIN  <- TX2 (D16) via 2.2k+3.3k level-shift divider
+ *   XBee DOUT -> RX2 (D17) direct
+ *   LCD connected via library (existing 4-bit wiring)
+ *
+ * Buttons to wire:
+ *   Left  joystick button -> D18 (PD3 / INT3)  active-low, use internal pull-up
+ *   Right joystick button -> D2  (PE4 / INT4)  active-low, use internal pull-up
+ *   Wire: one leg of button to the pin, other leg to GND.
+ *
+ * =====================================================================
+ * BUTTON BEHAVIOUR
+ * =====================================================================
+ *   Left  button (INT3): toggle MANUAL <-> AUTONOMOUS
+ *   Right button (INT4): toggle gripper closed (0 deg) <-> open (45 deg)
+ *
+ * =====================================================================
+ * LCD LAYOUT
+ * =====================================================================
+ *   Line 1 (0x00): direction + gripper state  OR  LOW BATT warning
+ *                  In AUTO: "AUTO: SEARCHING " or "AUTO: BEACON FND"
+ *   Line 2 (0x40): "Freq: XX Hz     "  or  "No freq detected"
+ *
+ * =====================================================================
+ * PACKET FORMAT  Controller -> Robot  (6 bytes)
+ * =====================================================================
+ *   [0] 0x02        command byte
+ *   [1] fc          forward component 0-253
+ *   [2] rc          rotation component 0-253
+ *   [3] gripper     0=closed, 1=open
+ *   [4] mode        0=manual, 1=autonomous
+ *   [5] checksum    [0]^[1]^[2]^[3]^[4]^0xFF
+ *
+ * =====================================================================
+ * PACKET FORMAT  Robot -> Controller  (6 bytes)
+ * =====================================================================
+ *   [0] 0x01        reply byte
+ *   [1] batt_high   battery mV high byte
+ *   [2] batt_low    battery mV low byte
+ *   [3] freq        beacon Hz (0 = not detected)
+ *   [4] 0x00        reserved
+ *   [5] checksum    [0]^[1]^[2]^[3]^[4]^0xFF
+ */
+
+#include "Controller.h"
+
+#define JOYSTICK_CENTRE     126
+#define DEAD_ZONE           10
+#define SEND_INTERVAL_MS    100
+#define BATT_ALERT_MV       7000
+
+#define CMD_DRIVE           0x02
+#define CMD_REPLY           0x01
+
+#define TX_SIZE             6
+#define RX_SIZE             6
+
+#define MODE_MANUAL         0
+#define MODE_AUTONOMOUS     1
+
+#define BTN_DEBOUNCE_MS     200
+
+volatile uint8_t  left_btn_flag     = 0;
+volatile uint8_t  right_btn_flag    = 0;
+volatile uint32_t left_btn_last_ms  = 0;
+volatile uint32_t right_btn_last_ms = 0;
+
+volatile uint8_t current_mode = MODE_MANUAL;
+volatile uint8_t gripper_open = 0;
+
+ISR(INT3_vect) // left joystick button
+{
+    uint32_t now = milliseconds_now();
+    if ((now - left_btn_last_ms) > BTN_DEBOUNCE_MS)
+    {
+        left_btn_flag    = 1;
+        left_btn_last_ms = now;
+    }
+}
+
+ISR(INT4_vect) // right joystick button
+{
+    uint32_t now = milliseconds_now();
+    if ((now - right_btn_last_ms) > BTN_DEBOUNCE_MS)
+    {
+        right_btn_flag    = 1;
+        right_btn_last_ms = now;
+    }
+}
+
+int main(void)
+{
+    DDRF  = 0x00;
+    PORTF = 0x00;
+
+    DDRD  &= ~(1 << PD3);
+    PORTD |=  (1 << PD3);
+
+    DDRE  &= ~(1 << PE4);
+    PORTE |=  (1 << PE4);
+
+    EICRA |=  (1 << ISC31);
+    EICRA &= ~(1 << ISC30);
+    EIMSK |=  (1 << INT3);
+
+    EICRB |=  (1 << ISC41);
+    EICRB &= ~(1 << ISC40);
+    EIMSK |=  (1 << INT4);
+
+    milliseconds_init();
+    lcd_init();
+    _delay_ms(20);
+    adc_init();
+    _delay_ms(20);
+    serial2_init();
+    _delay_ms(500);
+    serial0_init();
+    sei();
+
+    lcd_clrscr();
+    lcd_goto(0x00);
+    lcd_puts("MXEN2003 Rover  ");
+    lcd_goto(0x40);
+    lcd_puts("No freq detected");
+    _delay_ms(1500);
+
+    char     lcd_line1[17]  = {0};
+    char     lcd_line2[17]  = {0};
+    char     serial_str[80] = {0};
+    uint8_t  rx_buf[RX_SIZE];
+    uint16_t last_send_ms   = 0;
+
+    uint16_t batt_mv = 0;
+    uint8_t  beacon_freq = 0;
+
+    while (1)
+    {
+        uint16_t now = milliseconds_now();
+
+        if (left_btn_flag) // left button toggle
+        {
+            left_btn_flag = 0;
+
+            if (current_mode == MODE_MANUAL)
+            {
+                current_mode = MODE_AUTONOMOUS;
+                serial0_print_string("Mode: AUTO\n");
+            }
+            else
+            {
+                current_mode = MODE_MANUAL;
+                serial0_print_string("Mode: MANUAL\n");
+            }
+        }
+
+        if (right_btn_flag) // right button toggle
+        {
+            right_btn_flag = 0;
+
+            if (gripper_open == 0)
+            {
+                gripper_open = 1;
+                serial0_print_string("Gripper: OPEN\n");
+            }
+            else
+            {
+                gripper_open = 0;
+                serial0_print_string("Gripper: CLOSED\n");
+            }
+        }
+
+        uint8_t fc = (uint8_t)(((uint16_t)(adc_read(0) >> 2) * 253) / 255);
+        uint8_t rc = (uint8_t)(((uint16_t)(adc_read(1) >> 2) * 253) / 255);
+
+        if ((uint16_t)(now - last_send_ms) >= SEND_INTERVAL_MS)
+        {
+            last_send_ms = now;
+
+            uint8_t chk = CMD_DRIVE ^ fc ^ rc ^ gripper_open ^ current_mode ^ 0xFF;
+            serial2_write_bytes(TX_SIZE, CMD_DRIVE, fc, rc, gripper_open, current_mode, chk);
+
+            sprintf(serial_str, "TX fc:%3u rc:%3u grip:%u mode:%u\n", fc, rc, gripper_open, current_mode);
+            serial0_print_string(serial_str);
+        }
+
+        if (serial2_available())
+        {
+            serial2_get_data(rx_buf, RX_SIZE);
+
+            uint8_t chk = rx_buf[0] ^ rx_buf[1] ^ rx_buf[2] ^ rx_buf[3] ^ rx_buf[4] ^ 0xFF;
+
+            if (chk == rx_buf[5] && rx_buf[0] == CMD_REPLY)
+            {
+                batt_mv = ((uint16_t)rx_buf[1] << 8) | rx_buf[2];
+                beacon_freq = rx_buf[3];
+            }
+        }
+
+        if (batt_mv > 0 && batt_mv < BATT_ALERT_MV)
+        {
+            sprintf(lcd_line1, "LOW BATT%5umV ", batt_mv);
+        }
+        else if (current_mode == MODE_AUTONOMOUS)
+        {
+            if (beacon_freq > 0)
+            {
+                sprintf(lcd_line1, "AUTO: BEACON FND");
+            }
+            else
+            {
+                sprintf(lcd_line1, "AUTO: SEARCHING ");
+            }
+        }
+        else
+        {
+            int16_t fc_c = (int16_t)fc - JOYSTICK_CENTRE;
+            int16_t rc_c = (int16_t)rc - JOYSTICK_CENTRE;
+
+            const char *dir;
+            const char *grip;
+
+            /* Determine direction string */
+            if (abs(fc_c) < DEAD_ZONE && abs(rc_c) < DEAD_ZONE)
+            {
+                dir = "STOP ";
+            }
+            else if (abs(rc_c) > abs(fc_c))
+            {
+                if (rc_c > 0)
+                    dir = "RIGHT";
+                else
+                    dir = "LEFT ";
+            }
+            else
+            {
+                if (fc_c < 0)
+                    dir = "FWD  ";
+                else
+                    dir = "REV  ";
+            }
+
+            /* Determine gripper string */
+            if (gripper_open == 1)
+                grip = "OPEN";
+            else
+                grip = "CLSD";
+
+            sprintf(lcd_line1, "%s G:%s       ", dir, grip);
+        }
+
+        if (beacon_freq > 0)
+        {
+            sprintf(lcd_line2, "Freq: %2u Hz     ", beacon_freq);
+        }
+        else
+        {
+            sprintf(lcd_line2, "No freq detected");
+        }
+
+        lcd_goto(0x00);
+        lcd_puts(lcd_line1);
+        lcd_goto(0x40);
+        lcd_puts(lcd_line2);
+    }
+
+    return 0;
+}
