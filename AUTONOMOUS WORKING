@@ -1,0 +1,236 @@
+/*
+ * maze_follower.c
+ * Autonomous maze navigation - no controller.
+ *
+ * Sensors:
+ *   Front (GP2Y0A21YK, 10-80 cm)  -> ADC2
+ *   Right (GP2D120,    4-30 cm)   -> ADC3
+ *   Left  (GP2D120,    4-30 cm)   -> ADC4
+ *
+ * Motors:
+ *   OCR1A = left  wheel PWM
+ *   OCR1B = right wheel PWM
+ *   PA0/PA1 = left  direction
+ *   PA2/PA3 = right direction
+ */
+
+#include "Robot.h"
+
+/* ---- sensor pins (ADC channel numbers) ---- */
+#define FRONT_PIN       2
+#define RIGHT_PIN       3
+#define LEFT_PIN        4
+
+/* ---- distance thresholds (cm) ---- */
+#define FRONT_STOP_CM   15      /* start turning when wall is this close */
+#define FRONT_MAX_CM    80      /* clamp front reading to this */
+
+/* ---- motor speeds (0-100 scale) ---- */
+#define BASE_SPEED      100
+
+/* ---- LED ---- */
+#define LED_PIN         PB0
+
+void motor_pwm_init(void);
+void GPIO_init(void);
+void set_motors(int16_t lm, int16_t rm);
+
+uint16_t read_front_cm(void);
+uint16_t read_right_cm(void);
+uint16_t read_left_cm(void);
+
+int main(void)
+{
+    cli();
+    _delay_ms(20);
+    serial0_init();
+    _delay_ms(20);
+    GPIO_init();
+    adc_init();
+    motor_pwm_init();
+    milliseconds_init();
+    sei();
+
+    char buf[80] = {0};
+
+    while (1)
+    {
+        uint16_t front = read_front_cm();
+        uint16_t right = read_right_cm();
+        uint16_t left  = read_left_cm();
+        uint32_t a1    = adc_read(1) * 4.88 * 2 ;
+        if (a1 < 7000)
+            PORTB |=  (1 << LED_PIN);
+        else
+            PORTB &= ~(1 << LED_PIN);
+
+        /* clamp front sensor */
+        if (front > FRONT_MAX_CM) front = FRONT_MAX_CM;
+
+        int16_t lm = 0;
+        int16_t rm = 0;
+
+        if (left > 35)
+        {
+            left = 999;
+        }
+        if (right > 35)
+        {
+            right = 999;
+        }
+        if (front > 85)
+        {
+            front = 999;
+        }
+
+        /* --- open side: treat as a junction, turn into the opening --- */
+        if (front < 15)
+        {
+            if (right > left)
+            {
+                lm = BASE_SPEED;
+                rm = 0;
+            }
+            else
+            {
+                lm = 0;
+                rm = BASE_SPEED;
+            }
+
+        }
+        else if (abs((int16_t)left - (int16_t)right) < 10)
+        {
+            lm = BASE_SPEED;
+            rm = BASE_SPEED;
+        }
+        else if (left > 100)
+        {
+            lm = 0;
+            rm = BASE_SPEED;
+        }
+        else if (right > 100)
+        {
+            lm = BASE_SPEED;
+            rm = 0;
+        }
+        else if (right < 10)
+        {
+            lm = BASE_SPEED - (70 * 5 / right);
+            rm = BASE_SPEED;
+        }
+        else if (left < 10)
+        {
+            lm = BASE_SPEED;
+            rm = BASE_SPEED - (70 * 5 / left);
+        }
+        else
+        {
+            lm = BASE_SPEED - (70 * 5 / right);
+            rm = BASE_SPEED - (70 * 5 / left);
+        }
+        
+
+        /* clamp to valid range */
+        if (lm >  100) lm =  100;
+        if (rm >  100) rm =  100;
+        if (lm < -100) lm = -100;
+        if (rm < -100) rm = -100;
+
+        if (lm < 30)
+        {
+            lm = 0;
+        }
+        if (rm < 30)
+        {
+            rm = 0;
+        }
+
+
+        set_motors(rm, lm);
+        _delay_ms(50);
+        set_motors(0,0);
+        _delay_ms(50);
+
+        sprintf(buf, "F:%3u L:%3u R:%3u | lm:%3d rm:%3d | A1:%4u\n",
+                front, left, right, lm, rm, a1);
+        serial0_print_string(buf);
+        _delay_ms(20);
+    }
+
+    return 0;
+}
+
+/* ---- distance helpers ---- */
+
+uint16_t read_front_cm(void)
+{
+    uint16_t raw = adc_read(FRONT_PIN);
+    if (raw <= 10) return 999;
+    int16_t cm = (int16_t)(((10650.08 / (raw - 14.57)) - 12.4) / 1.4);
+    if (cm < 0) return 999;
+    return (uint16_t)cm;
+}
+
+uint16_t read_right_cm(void)
+{
+    uint16_t raw = adc_read(RIGHT_PIN);
+    if (raw == 0) return 999;
+    int16_t cm = (int16_t)((2585 / raw) - 1);
+    if (cm < 0) return 999;
+    return (uint16_t)cm;
+}
+
+uint16_t read_left_cm(void)
+{
+    uint16_t raw = adc_read(LEFT_PIN);
+    if (raw == 0) return 999;
+    int16_t cm = (int16_t)((2585 / raw) - 1);
+    if (cm < 0) return 999;
+    return (uint16_t)cm;
+}
+
+/* ---- motor and GPIO setup ---- */
+
+void set_motors(int16_t lm, int16_t rm)
+{
+    OCR1A = (int32_t)abs(lm) * 9999 / 100;
+    OCR1B = (int32_t)abs(rm) * 9999 / 100;
+
+    if (lm >= 0)
+    {
+        PORTA |=  (1 << PA0);
+        PORTA &= ~(1 << PA1);
+    }
+    else
+    {
+        PORTA &= ~(1 << PA0);
+        PORTA |=  (1 << PA1);
+    }
+
+    if (rm >= 0)
+    {
+        PORTA |=  (1 << PA2);
+        PORTA &= ~(1 << PA3);
+    }
+    else
+    {
+        PORTA &= ~(1 << PA2);
+        PORTA |=  (1 << PA3);
+    }
+}
+
+void motor_pwm_init(void)
+{
+    TCCR1A = (1 << COM1A1) | (1 << COM1B1) | (1 << WGM11);
+    TCCR1B = (1 << WGM13)  | (1 << CS11);
+    ICR1   = 9999;
+    OCR1A  = 0;
+    OCR1B  = 0;
+}
+
+void GPIO_init(void)
+{
+    DDRA |= (1 << DDA0) | (1 << DDA1) | (1 << DDA2) | (1 << DDA3);
+    DDRB |= (1 << DDB0) | (1 << DDB5) | (1 << DDB6);
+    PORTB = 0;
+}
