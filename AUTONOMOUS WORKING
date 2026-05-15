@@ -76,7 +76,7 @@ int main(void)
         {
             left = 999;
         }
-        if (right > 45)
+        if (right > 60)
         {
             right = 999;
         }
@@ -133,15 +133,15 @@ int main(void)
             set_motors(lm, rm);
             _delay_ms(300);
         }
-        else if (right < 10)
+        else if (right < 15)
         {
-            lm = BASE_SPEED - (70 * 5 / right);
+            lm = BASE_SPEED - (100 * 5 / right);
             rm = BASE_SPEED;
         }
-        else if (left < 10)
+        else if (left < 15)
         {
             lm = BASE_SPEED;
-            rm = BASE_SPEED - (70 * 5 / left);
+            rm = BASE_SPEED - (100 * 5 / left);
         }
         else
         {
