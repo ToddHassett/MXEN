@@ -26,7 +26,7 @@
 #define FRONT_MAX_CM    80      /* clamp front reading to this */
 
 /* ---- motor speeds (0-100 scale) ---- */
-#define BASE_SPEED      70
+#define BASE_SPEED      60
 
 /* ---- LED ---- */
 #define LED_PIN         PB0
@@ -72,11 +72,11 @@ int main(void)
         int16_t lm = 0;
         int16_t rm = 0;
 
-        if (left > 35)
+        if (left > 50)
         {
             left = 999;
         }
-        if (right > 35)
+        if (right > 50)
         {
             right = 999;
         }
@@ -100,15 +100,18 @@ int main(void)
 
         if (front < 15)
         {
-            if (right > left)
-            {
-                lm = -BASE_SPEED;
-                rm = BASE_SPEED;
-            }
-            else
+            if (left > right)
             {
                 lm = BASE_SPEED;
                 rm = -BASE_SPEED;
+                _delay_ms(50);
+            }
+            else
+            {
+                lm = -BASE_SPEED;
+                rm = BASE_SPEED;
+                _delay_ms(50);
+
             }
         }
         else if (abs((int16_t)left - (int16_t)right) < 2)
@@ -116,30 +119,26 @@ int main(void)
             lm = BASE_SPEED;
             rm = BASE_SPEED;
         }
-        else if (left > 100)
-        {
-            lm = 0;
-            rm = BASE_SPEED;
-        }
-        else if (right > 100)
+        else if ((left > 100) && (right < 100))
         {
             lm = BASE_SPEED;
             rm = 0;
+            set_motors(lm, rm);
+            _delay_ms(300);
         }
-        else if (right < 10)
+        else if ((right > 100) && (left < 100))
         {
-            lm = BASE_SPEED - (70 * 5 / right);
+            lm = 0;
             rm = BASE_SPEED;
-        }
-        else if (left < 10)
-        {
-            lm = BASE_SPEED;
-            rm = BASE_SPEED - (70 * 5 / left);
+            set_motors(lm, rm);
+            _delay_ms(300);
         }
         else
         {
-            lm = BASE_SPEED - (70 * 5 / right);
-            rm = BASE_SPEED - (70 * 5 / left);
+            int16_t error      = (int16_t)right - (int16_t)left;
+            int16_t correction = error;          /* K_p = 1 – raise to steer harder */
+            rm = BASE_SPEED - correction;
+            lm = BASE_SPEED + correction;
         }
         
 
@@ -163,7 +162,7 @@ int main(void)
         
         if ((front < 15) && (stop == 0))
         {
-            _delay_ms(100);
+            _delay_ms(80);
             stop = 0;
         }
         if (front > 15)
