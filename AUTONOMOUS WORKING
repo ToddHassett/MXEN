@@ -26,7 +26,7 @@
 #define FRONT_MAX_CM    80      /* clamp front reading to this */
 
 /* ---- motor speeds (0-100 scale) ---- */
-#define BASE_SPEED      100
+#define BASE_SPEED      70
 
 /* ---- LED ---- */
 #define LED_PIN         PB0
@@ -53,6 +53,10 @@ int main(void)
 
     char buf[80] = {0};
 
+    static uint16_t prev_front = 999;
+    static uint16_t prev_right = 999;
+    static uint16_t prev_left  = 999;
+    uint8_t stop = 0;
     while (1)
     {
         uint16_t front = read_front_cm();
@@ -64,17 +68,15 @@ int main(void)
         else
             PORTB &= ~(1 << LED_PIN);
 
-        /* clamp front sensor */
-        if (front > FRONT_MAX_CM) front = FRONT_MAX_CM;
 
         int16_t lm = 0;
         int16_t rm = 0;
 
-        if (left > 35)
+        if (left > 45)
         {
             left = 999;
         }
-        if (right > 35)
+        if (right > 45)
         {
             right = 999;
         }
@@ -83,35 +85,53 @@ int main(void)
             front = 999;
         }
 
-        /* --- open side: treat as a junction, turn into the opening --- */
+        /* require two consecutive sub-999 readings before accepting */
+        uint16_t raw_front = front;
+        uint16_t raw_right = right;
+        uint16_t raw_left  = left;
+
+        if (front < 999 && prev_front == 999) front = 999;
+        if (right < 999 && prev_right == 999) right = 999;
+        if (left  < 999 && prev_left  == 999) left  = 999;
+
+        prev_front = raw_front;
+        prev_right = raw_right;
+        prev_left  = raw_left;
+
         if (front < 15)
         {
-            if (right > left)
+            if (left > right)
             {
                 lm = BASE_SPEED;
-                rm = 0;
+                rm = -BASE_SPEED;
+                _delay_ms(50);
             }
             else
             {
-                lm = 0;
+                lm = -BASE_SPEED;
                 rm = BASE_SPEED;
-            }
+                _delay_ms(50);
 
+            }
         }
-        else if (abs((int16_t)left - (int16_t)right) < 10)
+        else if (abs((int16_t)left - (int16_t)right) < 2)
         {
             lm = BASE_SPEED;
             rm = BASE_SPEED;
         }
         else if (left > 100)
         {
-            lm = 0;
-            rm = BASE_SPEED;
+            lm = BASE_SPEED;
+            rm = 0;
+            set_motors(lm, rm);
+            _delay_ms(300);
         }
         else if (right > 100)
         {
-            lm = BASE_SPEED;
-            rm = 0;
+            lm = 0;
+            rm = BASE_SPEED;
+            set_motors(lm, rm);
+            _delay_ms(300);
         }
         else if (right < 10)
         {
@@ -136,25 +156,33 @@ int main(void)
         if (lm < -100) lm = -100;
         if (rm < -100) rm = -100;
 
-        if (lm < 30)
+        if (abs(lm) < 30)
         {
             lm = 0;
         }
-        if (rm < 30)
+        if (abs(rm) < 30)
         {
             rm = 0;
         }
 
-
+        
         set_motors(rm, lm);
-        _delay_ms(50);
-        set_motors(0,0);
-        _delay_ms(50);
+        
+        if ((front < 15) && (stop == 0))
+        {
+            _delay_ms(80);
+            stop = 0;
+        }
+        if (front > 15)
+        {
+            stop = 0;
+        }
 
-        sprintf(buf, "F:%3u L:%3u R:%3u | lm:%3d rm:%3d | A1:%4u\n",
+
+        sprintf(buf, "F:%3u L:%3u R:%3u | lm:%3d rm:%3d | A1:%4lu\n",
                 front, left, right, lm, rm, a1);
         serial0_print_string(buf);
-        _delay_ms(20);
+        _delay_ms(100);
     }
 
     return 0;
@@ -164,7 +192,7 @@ int main(void)
 
 uint16_t read_front_cm(void)
 {
-    uint16_t raw = adc_read(FRONT_PIN);
+    uint16_t raw = (adc_read(FRONT_PIN) + adc_read(FRONT_PIN) + adc_read(FRONT_PIN)) / 3;
     if (raw <= 10) return 999;
     int16_t cm = (int16_t)(((10650.08 / (raw - 14.57)) - 12.4) / 1.4);
     if (cm < 0) return 999;
@@ -173,7 +201,7 @@ uint16_t read_front_cm(void)
 
 uint16_t read_right_cm(void)
 {
-    uint16_t raw = adc_read(RIGHT_PIN);
+    uint16_t raw = (adc_read(RIGHT_PIN) + adc_read(RIGHT_PIN) + adc_read(RIGHT_PIN)) / 3;
     if (raw == 0) return 999;
     int16_t cm = (int16_t)((2585 / raw) - 1);
     if (cm < 0) return 999;
@@ -182,7 +210,7 @@ uint16_t read_right_cm(void)
 
 uint16_t read_left_cm(void)
 {
-    uint16_t raw = adc_read(LEFT_PIN);
+    uint16_t raw = (adc_read(LEFT_PIN) + adc_read(LEFT_PIN) + adc_read(LEFT_PIN)) / 3;
     if (raw == 0) return 999;
     int16_t cm = (int16_t)((2585 / raw) - 1);
     if (cm < 0) return 999;
