@@ -1,0 +1,210 @@
+#include "Robot.h"
+
+#define FRONT_PIN 2
+#define RIGHT_PIN 3
+#define LEFT_PIN 4
+
+
+#define BASE_SPEED 70
+
+#define LED_PIN PB0
+
+void motor_pwm_init(void);
+void GPIO_init(void);
+void set_motors(int16_t lm, int16_t rm);
+
+uint16_t read_front_cm(void);
+uint16_t read_right_cm(void);
+uint16_t read_left_cm(void);
+
+int main(void)
+{
+    cli();
+    _delay_ms(20);
+    serial0_init();
+    _delay_ms(20);
+    GPIO_init();
+    adc_init();
+    motor_pwm_init();
+    milliseconds_init();
+    sei();
+
+    char buf[80] = {0};
+
+    while (1)
+    {
+        static uint16_t prev_right = 999;
+        static uint16_t prev_left  = 999;
+
+        uint16_t front = read_front_cm();
+        uint16_t right = read_right_cm();
+        uint16_t left  = read_left_cm();
+
+        uint16_t raw_right = right;
+        uint16_t raw_left  = left;
+
+        if (right < 35 && prev_right >= 35) right = 999;
+        if (left  < 35 && prev_left  >= 35) left  = 999;
+
+        prev_right = raw_right;
+        prev_left  = raw_left;
+        uint32_t a1 = adc_read(1) * 4.88 * 2;
+
+        if (a1 < 7000)
+        {
+            PORTB |=  (1 << LED_PIN);
+        }
+        else
+        {
+            PORTB &= ~(1 << LED_PIN);
+        }
+
+        int16_t lm = 0;
+        int16_t rm = 0;
+
+        if (front > 80) 
+        {
+            front = 80;
+        }
+
+        if (left > 35)
+        {
+            left = 999;
+        }
+        if (right > 35)
+        {
+            right = 999;
+        }
+
+        if (front < 15)
+        {
+            if (right > left)
+            {
+                lm = BASE_SPEED;
+                rm = -BASE_SPEED;
+            }
+            else
+            {
+                lm = -BASE_SPEED;
+                rm = BASE_SPEED;
+            }
+        }
+        else if (abs(left - right) < 2)
+        {
+            lm = BASE_SPEED;
+            rm = BASE_SPEED;
+        }
+        else if (left > 100)
+        {
+            lm = -0;
+            rm = BASE_SPEED;
+        }
+        else if (right > 100)
+        {
+            lm = BASE_SPEED;
+            rm = -0;
+        }
+        else if (right < 10)
+        {
+            lm = -0;
+            rm = BASE_SPEED;
+        }
+        else if (left < 10)
+        {
+            lm = BASE_SPEED;
+            rm = -0;
+        }
+        else
+        {
+            lm = BASE_SPEED - (70 * 5 / right);
+            rm = BASE_SPEED - (70 * 5 / left);
+        }
+        
+
+
+
+
+        set_motors(rm, lm);
+        _delay_ms(100);
+
+        sprintf(buf, "F:%3u L:%3u R:%3u | lm:%3d rm:%3d | A1:%4u\n",
+                front, left, right, lm, rm, a1);
+        serial0_print_string(buf);
+        _delay_ms(20);
+    }
+
+    return 0;
+}
+
+
+uint16_t read_front_cm(void)
+{
+    uint16_t raw = (adc_read(FRONT_PIN) + adc_read(FRONT_PIN) + adc_read(FRONT_PIN)) / 3;
+    if (raw <= 10) return -1;
+    int16_t cm = (int16_t)(((10650.08 / (raw - 14.57)) - 12.4) / 1.4);
+    if (cm < 0) return -1;
+    return (uint16_t)cm;
+}
+
+uint16_t read_right_cm(void)
+{
+    uint16_t raw = (adc_read(RIGHT_PIN) + adc_read(RIGHT_PIN) + adc_read(RIGHT_PIN)) / 3;
+    if (raw == 0) return -1;
+    int16_t cm = (int16_t)((2585 / raw) - 1);
+    if (cm < 0) return -1;
+    return (uint16_t)cm;
+}
+
+uint16_t read_left_cm(void)
+{
+    uint16_t raw = (adc_read(LEFT_PIN) + adc_read(LEFT_PIN) + adc_read(LEFT_PIN)) / 3;
+    if (raw == 0) return -1;
+    int16_t cm = (int16_t)((2585 / raw) - 1);
+    if (cm < 0) return -1;
+    return (uint16_t)cm;
+}
+
+
+void set_motors(int16_t lm, int16_t rm)
+{
+    OCR1A = (int32_t)abs(lm) * 9999 / 100;
+    OCR1B = (int32_t)abs(rm) * 9999 / 100;
+
+    if (lm >= 0)
+    {
+        PORTA |=  (1 << PA0);
+        PORTA &= ~(1 << PA1);
+    }
+    else
+    {
+        PORTA &= ~(1 << PA0);
+        PORTA |=  (1 << PA1);
+    }
+
+    if (rm >= 0)
+    {
+        PORTA |=  (1 << PA2);
+        PORTA &= ~(1 << PA3);
+    }
+    else
+    {
+        PORTA &= ~(1 << PA2);
+        PORTA |=  (1 << PA3);
+    }
+}
+
+void motor_pwm_init(void)
+{
+    TCCR1A = (1 << COM1A1) | (1 << COM1B1) | (1 << WGM11);
+    TCCR1B = (1 << WGM13)  | (1 << CS11);
+    ICR1   = 9999;
+    OCR1A  = 0;
+    OCR1B  = 0;
+}
+
+void GPIO_init(void)
+{
+    DDRA |= (1 << DDA0) | (1 << DDA1) | (1 << DDA2) | (1 << DDA3);
+    DDRB |= (1 << DDB0) | (1 << DDB5) | (1 << DDB6);
+    PORTB = 0;
+}
