@@ -1,0 +1,262 @@
+/*
+ * Robot.c
+ * Autonomous maze navigation.
+ *
+ * Two navigation states:
+ *   FORWARD – drive straight; center between walls if both visible, otherwise
+ *             track whichever wall is visible; hard-steer away from any wall
+ *             closer than WALL_AVOID_CM
+ *   TURN    – stopped sampling (10 ADC reads each side), then spin in place
+ *             for TURN_90_MS to complete a 90° turn, then back to FORWARD
+ *
+ * Sensors:
+ *   Front (GP2Y0A21YK, 10-80 cm)  -> ADC2
+ *   Right (GP2D120,    4-30 cm)   -> ADC3
+ *   Left  (GP2D120,    4-30 cm)   -> ADC4
+ *
+ * Motors:
+ *   OCR1A = left  wheel PWM   (first  arg of set_motors)
+ *   OCR1B = right wheel PWM   (second arg of set_motors)
+ *   PA0/PA1 = left  direction
+ *   PA2/PA3 = right direction
+ */
+
+#include "Robot.h"
+
+#define FRONT_PIN           2
+#define RIGHT_PIN           3
+#define LEFT_PIN            4
+
+#define FRONT_STOP_CM       8       /* trigger turn when front wall ≤ this       */
+#define WALL_TRACK_CM       13      /* desired gap to side wall                  */
+#define WALL_AVOID_CM       7       /* hard-steer away when side wall ≤ this     */
+#define BASE_SPEED          60      /* normal forward speed                      */
+#define TURN_SPEED          60      /* spin speed during 90° turn                */
+#define TRACK_KP            3       /* P-gain for wall centering / following     */
+#define TURN_90_MS          1400     /* tune this until a 90° spin is achieved    */
+
+#define LED_PIN             PB0
+
+typedef enum { STATE_FORWARD, STATE_TURN } NavState;
+
+void motor_pwm_init(void);
+void GPIO_init(void);
+void set_motors(int16_t lm, int16_t rm);
+
+uint16_t read_front_cm(void);
+uint16_t read_right_cm(void);
+uint16_t read_left_cm(void);
+
+/* Take 10 ADC samples of each side to pick the more open direction.
+   Returns 1 (turn left) or -1 (turn right). */
+static int8_t choose_turn_dir(void)
+{
+    uint32_t sl = 0, sr = 0;
+    for (uint8_t i = 0; i < 10; i++) {
+        uint16_t l = read_left_cm();
+        uint16_t r = read_right_cm();
+        sl += (l < 999) ? l : 80;
+        sr += (r < 999) ? r : 80;
+        _delay_ms(20);
+    }
+    return (sl > sr) ? 1 : -1;   /* larger sum = more open side */
+}
+
+int main(void)
+{
+    cli();
+    _delay_ms(20);
+    serial0_init();
+    _delay_ms(20);
+    GPIO_init();
+    adc_init();
+    motor_pwm_init();
+    milliseconds_init();
+    sei();
+
+    char buf[80] = {0};
+
+    NavState state         = STATE_FORWARD;
+    int8_t   turn_dir      = 0;
+    uint32_t turn_start_ms = 0;
+
+    uint16_t prev_front = 999;
+    uint16_t prev_right = 999;
+    uint16_t prev_left  = 999;
+
+    while (1)
+    {
+        /* ---- read & filter sensors ----------------------------------- */
+        uint16_t front = read_front_cm();
+        uint16_t right = read_right_cm();
+        uint16_t left  = read_left_cm();
+
+        uint32_t a1 = adc_read(1) * 4.88 * 2;
+        if (a1 < 7000) PORTB |=  (1 << LED_PIN);
+        else            PORTB &= ~(1 << LED_PIN);
+
+        if (left  > 50) left  = 999;
+        if (right > 50) right = 999;
+        if (front > 85) front = 999;
+
+        uint16_t raw_front = front, raw_right = right, raw_left = left;
+        if (front < 999 && prev_front == 999) front = 999;
+        if (right < 999 && prev_right == 999) right = 999;
+        if (left  < 999 && prev_left  == 999) left  = 999;
+        prev_front = raw_front;
+        prev_right = raw_right;
+        prev_left  = raw_left;
+
+        int16_t lm = 0, rm = 0;
+
+        /* ---- state machine ------------------------------------------ */
+        switch (state)
+        {
+            /* ---------------------------------------------------------- */
+            case STATE_FORWARD:
+            /* Center between walls (or track whichever wall is visible). */
+            /* Hard-steer away from any wall that gets too close.         */
+            /* ---------------------------------------------------------- */
+                if (front < FRONT_STOP_CM) {
+                    set_motors(0, 0);
+                    turn_dir      = choose_turn_dir();
+                    turn_start_ms = milliseconds_now();
+                    state         = STATE_TURN;
+                    break;
+                }
+
+                {
+                    bool lv = (left  < 999);
+                    bool rv = (right < 999);
+
+                    int16_t error = 0;
+                    if      (lv && rv) error = left - right;           /* center        */
+                    else if (lv)       error = left  - WALL_TRACK_CM;  /* track left    */
+                    else if (rv)       error = WALL_TRACK_CM - right;  /* track right   */
+
+                    int16_t correction = TRACK_KP * error;
+                    if (correction >  BASE_SPEED) correction =  BASE_SPEED;
+                    if (correction < -BASE_SPEED) correction = -BASE_SPEED;
+
+                    lm = BASE_SPEED + correction;
+                    rm = BASE_SPEED - correction;
+
+                    /* hard avoidance: overrides P correction */
+                    if (left < WALL_AVOID_CM) {
+                        lm = BASE_SPEED / 2;
+                        rm = BASE_SPEED;
+                    } else if (right < WALL_AVOID_CM) {
+                        lm = BASE_SPEED;
+                        rm = BASE_SPEED / 2;
+                    }
+
+                    if (lm < 0) lm = 0;
+                    if (rm < 0) rm = 0;
+                    if (lm > BASE_SPEED) lm = BASE_SPEED;
+                    if (rm > BASE_SPEED) rm = BASE_SPEED;
+                }
+                break;
+
+            /* ---------------------------------------------------------- */
+            case STATE_TURN:
+            /* Spin in place for TURN_90_MS, then resume forward.         */
+            /* ---------------------------------------------------------- */
+                if (turn_dir == 1) {        /* left:  left back, right fwd */
+                    lm = -TURN_SPEED;
+                    rm =  TURN_SPEED;
+                } else {                    /* right: left fwd,  right back */
+                    lm =  TURN_SPEED;
+                    rm = -TURN_SPEED;
+                }
+                if (milliseconds_now() - turn_start_ms >= TURN_90_MS) {
+                    lm    = rm = 0;
+                    state = STATE_FORWARD;
+                }
+                break;
+        }
+
+        set_motors(lm, rm);
+
+        sprintf(buf, "F:%3u L:%3u R:%3u | lm:%4d rm:%4d | st:%d\n",
+                front, left, right, lm, rm, (int)state);
+        serial0_print_string(buf);
+        _delay_ms(20);
+    }
+
+    return 0;
+}
+
+/* ---- distance helpers ---- */
+
+uint16_t read_front_cm(void)
+{
+    uint16_t raw = (adc_read(FRONT_PIN) + adc_read(FRONT_PIN) + adc_read(FRONT_PIN)) / 3;
+    if (raw <= 10) return 999;
+    int16_t cm = (int16_t)(((10650.08 / (raw - 14.57)) - 12.4) / 1.4);
+    if (cm < 0) return 999;
+    return (uint16_t)cm;
+}
+
+uint16_t read_right_cm(void)
+{
+    uint16_t raw = (adc_read(RIGHT_PIN) + adc_read(RIGHT_PIN) + adc_read(RIGHT_PIN)) / 3;
+    if (raw == 0) return 999;
+    int16_t cm = (int16_t)((2585 / raw) - 1);
+    if (cm < 0) return 999;
+    return (uint16_t)cm;
+}
+
+uint16_t read_left_cm(void)
+{
+    uint16_t raw = (adc_read(LEFT_PIN) + adc_read(LEFT_PIN) + adc_read(LEFT_PIN)) / 3;
+    if (raw == 0) return 999;
+    int16_t cm = (int16_t)((2585 / raw) - 1);
+    if (cm < 0) return 999;
+    return (uint16_t)cm;
+}
+
+/* ---- motor and GPIO setup ---- */
+
+void set_motors(int16_t lm, int16_t rm)
+{
+    OCR1A = (int32_t)abs(lm) * 9999 / 100;
+    OCR1B = (int32_t)abs(rm) * 9999 / 100;
+
+    if (lm >= 0)
+    {
+        PORTA |=  (1 << PA0);
+        PORTA &= ~(1 << PA1);
+    }
+    else
+    {
+        PORTA &= ~(1 << PA0);
+        PORTA |=  (1 << PA1);
+    }
+
+    if (rm >= 0)
+    {
+        PORTA |=  (1 << PA2);
+        PORTA &= ~(1 << PA3);
+    }
+    else
+    {
+        PORTA &= ~(1 << PA2);
+        PORTA |=  (1 << PA3);
+    }
+}
+
+void motor_pwm_init(void)
+{
+    TCCR1A = (1 << COM1A1) | (1 << COM1B1) | (1 << WGM11);
+    TCCR1B = (1 << WGM13)  | (1 << CS11);
+    ICR1   = 9999;
+    OCR1A  = 0;
+    OCR1B  = 0;
+}
+
+void GPIO_init(void)
+{
+    DDRA |= (1 << DDA0) | (1 << DDA1) | (1 << DDA2) | (1 << DDA3);
+    DDRB |= (1 << DDB0) | (1 << DDB5) | (1 << DDB6);
+    PORTB = 0;
+}
