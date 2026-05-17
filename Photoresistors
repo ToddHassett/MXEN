@@ -1,0 +1,108 @@
+#include "adc.h"
+#include "Robot.h"
+
+#define LDR_LEFT_CH  5
+#define LDR_RIGHT_CH 6
+
+#define LDR_DEBOUNCE_MS    0
+#define BEACON_PERIOD_MIN  25   // ms = max 30Hz
+#define BEACON_PERIOD_MAX  500  // ms = min 2Hz
+#define FREQ_CONFIRM_COUNT 3
+
+volatile uint8_t  ldr_state[2]       = {0, 0};
+volatile uint32_t ldr_last_edge[2]   = {0, 0};
+volatile uint32_t ldr_last_rising[2] = {0, 0};
+volatile uint32_t ldr_period[2]      = {0, 0};
+volatile uint8_t  ldr_confirm[2]     = {0, 0};
+volatile uint8_t  ldr_freq_hz[2]     = {0, 0};
+volatile uint16_t ldr_min[2]         = {1023, 1023};
+volatile uint16_t ldr_max[2]         = {0, 0};
+
+void update_ldr(uint8_t idx, uint16_t adc_val, uint32_t now_ms);
+
+int main(void){
+    cli();
+    _delay_ms(20);
+    serial0_init();
+    _delay_ms(20);
+    adc_init();
+    milliseconds_init();
+    sei();
+
+    char serial_string[80] = {0};
+
+    while(1){
+        uint32_t now = milliseconds_now();
+
+        update_ldr(0, adc_read(LDR_LEFT_CH),  now);
+        update_ldr(1, adc_read(LDR_RIGHT_CH), now);
+
+        static uint32_t last_print_ms = 0;
+        if ((uint32_t)(now - last_print_ms) >= 200){
+            last_print_ms = now;
+
+            sprintf(serial_string, "LEFT:  %u Hz\n", ldr_freq_hz[0]);
+            serial0_print_string(serial_string);
+
+            sprintf(serial_string, "RIGHT: %u Hz\n", ldr_freq_hz[1]);
+            serial0_print_string(serial_string);
+
+            serial0_print_string("---\n");
+        }
+    }
+    return 0;
+}
+
+void update_ldr(uint8_t idx, uint16_t adc_val, uint32_t now_ms){
+    if (adc_val < ldr_min[idx]){
+        ldr_min[idx] = adc_val;
+    } else if (ldr_min[idx] < adc_val && (now_ms % 10) == 0){
+        ldr_min[idx]++;
+    }
+    if (adc_val > ldr_max[idx]){
+        ldr_max[idx] = adc_val;
+    } else if (ldr_max[idx] > adc_val && (now_ms % 10) == 0){
+        ldr_max[idx]--;
+    }
+
+    uint16_t range = ldr_max[idx] - ldr_min[idx];
+    if (range < 50){
+        ldr_freq_hz[idx] = 0;
+        return;
+    }
+    uint16_t threshold = ldr_min[idx] + range / 3;
+
+    uint8_t new_state = (adc_val > threshold) ? 1 : 0;
+    if (new_state == ldr_state[idx]) return;
+
+    uint32_t gap = now_ms - ldr_last_edge[idx];
+    if (LDR_DEBOUNCE_MS > 0 && gap < LDR_DEBOUNCE_MS) return;
+
+    if (new_state == 1){
+        if (ldr_last_rising[idx] > 0){
+            uint32_t period = now_ms - ldr_last_rising[idx];
+            if (period >= BEACON_PERIOD_MIN && period <= BEACON_PERIOD_MAX){
+                uint32_t diff = (uint32_t)labs((int32_t)period - (int32_t)ldr_period[idx]);
+                if (ldr_confirm[idx] == 0 || diff < (ldr_period[idx] / 3)){
+                    ldr_period[idx] = period;
+                    ldr_confirm[idx]++;
+                    if (ldr_confirm[idx] >= FREQ_CONFIRM_COUNT){
+                        ldr_freq_hz[idx] = (uint8_t)((1000 + ldr_period[idx]/2) / ldr_period[idx]);
+                        ldr_confirm[idx] = FREQ_CONFIRM_COUNT;
+                    }
+                } else {
+                    ldr_period[idx]  = period;
+                    ldr_confirm[idx] = 1;
+                }
+            } else {
+                ldr_confirm[idx] = 0;
+                ldr_freq_hz[idx] = 0;
+                ldr_period[idx]  = 0;
+            }
+        }
+        ldr_last_rising[idx] = now_ms;
+    }
+
+    ldr_last_edge[idx] = now_ms;
+    ldr_state[idx]     = new_state;
+}
