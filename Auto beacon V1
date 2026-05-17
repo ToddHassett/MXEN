@@ -1,0 +1,494 @@
+/*
+ * Robot.c
+ * Autonomous maze navigation with beacon detection.
+ *
+ * Navigation states:
+ *   FORWARD       – drive straight; wall-follow/center using IR sensors
+ *   TURN          – stopped; sample sides, spin 90°, resume FORWARD
+ *   BEACON_FOUND  – beacon detected; drive toward it using LDR steering
+ *   BEACON_PAUSE  – stopped 5 cm away; wait 2s for LDR to settle
+ *   BEACON_STOP   – take 10 frequency samples, record mode, print, resume
+ *
+ * Distance sensors:
+ *   Front (GP2Y0A21YK, 10-80 cm)  -> ADC2
+ *   Right (GP2D120,    4-30 cm)   -> ADC3
+ *   Left  (GP2D120,    4-30 cm)   -> ADC4
+ *
+ * LDR (photoresistor) sensors:
+ *   Left  LDR -> ADC5
+ *   Right LDR -> ADC6
+ *
+ * Motors:
+ *   OCR1A = left  wheel PWM   (first  arg of set_motors)
+ *   OCR1B = right wheel PWM   (second arg of set_motors)
+ *   PA0/PA1 = left  direction
+ *   PA2/PA3 = right direction
+ *
+ * Loop structure:
+ *   update_ldr() runs every iteration with no delay — it must catch edges
+ *   at up to ~30 Hz (period 33 ms), so it cannot be gated.
+ *   Everything else (IR reads, motor writes, serial) runs on a 20 ms tick
+ *   via a non-blocking timestamp check. _delay_ms() is gone from the main
+ *   loop entirely.
+ */
+
+#include "Robot.h"
+
+/* ---- IR distance sensor pins ---- */
+#define FRONT_PIN           2
+#define RIGHT_PIN           3
+#define LEFT_PIN            4
+
+/* ---- LDR pins ---- */
+#define LDR_LEFT_CH         5
+#define LDR_RIGHT_CH        6
+
+/* ---- IR sensor thresholds ---- */
+#define FRONT_STOP_CM       8       /* trigger turn when front wall <= this       */
+#define BEACON_STOP_CM      5       /* stop in front of beacon at this distance   */
+#define WALL_TRACK_CM       13      /* desired gap to side wall                   */
+#define WALL_AVOID_CM       7       /* hard-steer away when side wall <= this     */
+
+/* ---- motor speeds ---- */
+#define BASE_SPEED          60
+#define TURN_SPEED          60
+#define BEACON_SPEED        50      /* slower approach toward beacon              */
+
+/* ---- control gains ---- */
+#define TRACK_KP            20      /* P-gain for wall centering / following      */
+#define BEACON_KP           8       /* P-gain for LDR steering toward beacon      */
+
+/* ---- timing ---- */
+#define CONTROL_TICK_MS     20      /* IR reads, motor writes, serial print rate  */
+#define TURN_90_MS          1250    /* tune until a 90 degree spin is achieved    */
+#define BEACON_SAMPLE_MS    50      /* gap between frequency samples              */
+#define BEACON_PAUSE_MS     2000    /* sit still this long before sampling        */
+
+/* ---- beacon / LDR config ---- */
+#define LDR_DEBOUNCE_MS     0
+#define BEACON_PERIOD_MIN   25      /* ms -> max ~40 Hz                           */
+#define BEACON_PERIOD_MAX   500     /* ms -> min  2 Hz                            */
+#define FREQ_CONFIRM_COUNT  3
+#define FREQ_MAX_HZ         40      /* upper bound for vote array                 */
+
+#define LED_PIN             PB0
+
+/* ---- state machine ---- */
+typedef enum {
+    STATE_FORWARD,
+    STATE_TURN,
+    STATE_BEACON_FOUND,
+    STATE_BEACON_PAUSE,
+    STATE_BEACON_STOP
+} NavState;
+
+/* ---- LDR state ---- */
+volatile uint8_t  ldr_state[2]       = {0, 0};
+volatile uint32_t ldr_last_edge[2]   = {0, 0};
+volatile uint32_t ldr_last_rising[2] = {0, 0};
+volatile uint32_t ldr_period[2]      = {0, 0};
+volatile uint8_t  ldr_confirm[2]     = {0, 0};
+volatile uint8_t  ldr_freq_hz[2]     = {0, 0};
+volatile uint16_t ldr_min[2]         = {1023, 1023};
+volatile uint16_t ldr_max[2]         = {0, 0};
+
+/* ---- saved beacon result ---- */
+static uint8_t beacon_freq_hz = 0;
+
+/* ---- function prototypes ---- */
+void     motor_pwm_init(void);
+void     GPIO_init(void);
+void     set_motors(int16_t lm, int16_t rm);
+uint16_t read_front_cm(void);
+uint16_t read_right_cm(void);
+uint16_t read_left_cm(void);
+void     update_ldr(uint8_t idx, uint16_t adc_val, uint32_t now_ms);
+
+/* Take 10 ADC samples of each side to pick the more open direction.
+   Returns 1 (turn left) or -1 (turn right). */
+static int8_t choose_turn_dir(void)
+{
+    uint32_t sl = 0, sr = 0;
+    for (uint8_t i = 0; i < 10; i++) {
+        uint16_t l = read_left_cm();
+        uint16_t r = read_right_cm();
+        sl += (l < 999) ? l : 80;
+        sr += (r < 999) ? r : 80;
+        _delay_ms(20);
+    }
+    return (sl > sr) ? 1 : -1;
+}
+
+/* Sample frequency 10 times (50 ms apart) and return the most common value.
+   update_ldr() runs inside the wait so the edge detector stays live.        */
+static uint8_t sample_beacon_freq(void)
+{
+    uint8_t votes[FREQ_MAX_HZ + 1] = {0};
+
+    for (uint8_t i = 0; i < 10; i++) {
+        uint32_t t0 = milliseconds_now();
+        while ((uint32_t)(milliseconds_now() - t0) < BEACON_SAMPLE_MS) {
+            uint32_t now = milliseconds_now();
+            update_ldr(0, adc_read(LDR_LEFT_CH),  now);
+            update_ldr(1, adc_read(LDR_RIGHT_CH), now);
+        }
+        uint8_t hz = (ldr_freq_hz[0] > 0) ? ldr_freq_hz[0] : ldr_freq_hz[1];
+        if (hz > 0 && hz <= FREQ_MAX_HZ) {
+            votes[hz]++;
+        }
+    }
+
+    uint8_t best_hz = 0, best_count = 0;
+    for (uint8_t h = 1; h <= FREQ_MAX_HZ; h++) {
+        if (votes[h] > best_count) {
+            best_count = votes[h];
+            best_hz    = h;
+        }
+    }
+    return best_hz;
+}
+
+int main(void)
+{
+    cli();
+    _delay_ms(20);
+    serial0_init();
+    _delay_ms(20);
+    GPIO_init();
+    adc_init();
+    motor_pwm_init();
+    milliseconds_init();
+    sei();
+
+    char buf[80] = {0};
+
+    NavState state           = STATE_FORWARD;
+    int8_t   turn_dir        = 0;
+    uint32_t turn_start_ms   = 0;
+    uint32_t pause_start_ms  = 0;
+    uint32_t last_control_ms = 0;
+
+    uint16_t prev_front = 999;
+    uint16_t prev_right = 999;
+    uint16_t prev_left  = 999;
+
+    /* Sensor and motor values held across ticks. */
+    uint16_t front = 999, left = 999, right = 999;
+    int16_t  lm = 0, rm = 0;
+
+    while (1)
+    {
+        uint32_t now = milliseconds_now();
+
+        /* ---- LDR: runs every iteration, no gate ---- */
+        update_ldr(0, adc_read(LDR_LEFT_CH),  now);
+        update_ldr(1, adc_read(LDR_RIGHT_CH), now);
+
+        /* ---- everything else on a 20 ms tick ---- */
+        if ((uint32_t)(now - last_control_ms) < CONTROL_TICK_MS) continue;
+        last_control_ms = now;
+
+        /* ---- read & filter IR distance sensors ---- */
+        front = read_front_cm();
+        right = read_right_cm();
+        left  = read_left_cm();
+
+        /* Battery LED */
+        uint32_t a1 = adc_read(1) * 4.88 * 2;
+        if (a1 < 7000) PORTB |=  (1 << LED_PIN);
+        else            PORTB &= ~(1 << LED_PIN);
+
+        if (left  > 50) left  = 999;
+        if (right > 50) right = 999;
+        if (front > 85) front = 999;
+
+        uint16_t raw_front = front, raw_right = right, raw_left = left;
+        if (front < 999 && prev_front == 999) front = 999;
+        if (right < 999 && prev_right == 999) right = 999;
+        if (left  < 999 && prev_left  == 999) left  = 999;
+        prev_front = raw_front;
+        prev_right = raw_right;
+        prev_left  = raw_left;
+
+        bool beacon_visible = (ldr_freq_hz[0] > 0 || ldr_freq_hz[1] > 0);
+
+        lm = 0;
+        rm = 0;
+
+        /* ---- state machine ---- */
+        switch (state)
+        {
+            /* ---------------------------------------------------------- */
+            case STATE_FORWARD:
+            /* Normal wall-following. Jumps to BEACON_FOUND on first      */
+            /* confirmed LDR reading.                                      */
+            /* ---------------------------------------------------------- */
+                if (beacon_visible) {
+                    state = STATE_BEACON_FOUND;
+                    break;
+                }
+
+                if (front < FRONT_STOP_CM) {
+                    set_motors(0, 0);
+                    turn_dir      = choose_turn_dir();
+                    turn_start_ms = milliseconds_now();
+                    state         = STATE_TURN;
+                    break;
+                }
+
+                {
+                    bool lv = (left  < 999);
+                    bool rv = (right < 999);
+
+                    int16_t error = 0;
+                    if      (lv && rv) error = left - right;
+                    else if (lv)       error = left  - WALL_TRACK_CM;
+                    else if (rv)       error = WALL_TRACK_CM - right;
+
+                    int16_t correction = TRACK_KP * error;
+                    if (correction >  BASE_SPEED) correction =  BASE_SPEED;
+                    if (correction < -BASE_SPEED) correction = -BASE_SPEED;
+
+                    lm = BASE_SPEED + correction;
+                    rm = BASE_SPEED - correction;
+
+                    if (left < WALL_AVOID_CM) {
+                        lm = BASE_SPEED / 2;
+                        rm = BASE_SPEED;
+                    } else if (right < WALL_AVOID_CM) {
+                        lm = BASE_SPEED;
+                        rm = BASE_SPEED / 2;
+                    }
+
+                    if (lm < 0) lm = 0;
+                    if (rm < 0) rm = 0;
+                    if (lm > BASE_SPEED) lm = BASE_SPEED;
+                    if (rm > BASE_SPEED) rm = BASE_SPEED;
+                }
+                break;
+
+            /* ---------------------------------------------------------- */
+            case STATE_TURN:
+            /* Spin in place for TURN_90_MS, then resume FORWARD.         */
+            /* ---------------------------------------------------------- */
+                if (turn_dir == 1) {
+                    lm = -TURN_SPEED;
+                    rm =  TURN_SPEED;
+                } else {
+                    lm =  TURN_SPEED;
+                    rm = -TURN_SPEED;
+                }
+                if (milliseconds_now() - turn_start_ms >= TURN_90_MS) {
+                    lm    = rm = 0;
+                    state = STATE_FORWARD;
+                }
+                break;
+
+            /* ---------------------------------------------------------- */
+            case STATE_BEACON_FOUND:
+            /* Drive toward beacon using LDR brightness difference.       */
+            /* Fall back to FORWARD if signal is lost.                    */
+            /* ---------------------------------------------------------- */
+                if (!beacon_visible) {
+                    state = STATE_FORWARD;
+                    break;
+                }
+
+                if (front != 999 && front <= BEACON_STOP_CM) {
+                    set_motors(0, 0);
+                    pause_start_ms = milliseconds_now();
+                    state          = STATE_BEACON_PAUSE;
+                    break;
+                }
+
+                {
+                    uint16_t ldr_l = adc_read(LDR_LEFT_CH);
+                    uint16_t ldr_r = adc_read(LDR_RIGHT_CH);
+
+                    int16_t ldr_error  = (int16_t)ldr_l - (int16_t)ldr_r;
+                    int16_t correction = (BEACON_KP * ldr_error) / 100;
+
+                    if (correction >  BEACON_SPEED) correction =  BEACON_SPEED;
+                    if (correction < -BEACON_SPEED) correction = -BEACON_SPEED;
+
+                    lm = BEACON_SPEED + correction;
+                    rm = BEACON_SPEED - correction;
+
+                    if (left < WALL_AVOID_CM) {
+                        lm = BEACON_SPEED / 2;
+                        rm = BEACON_SPEED;
+                    } else if (right < WALL_AVOID_CM) {
+                        lm = BEACON_SPEED;
+                        rm = BEACON_SPEED / 2;
+                    }
+
+                    if (lm < 0) lm = 0;
+                    if (rm < 0) rm = 0;
+                    if (lm > BEACON_SPEED) lm = BEACON_SPEED;
+                    if (rm > BEACON_SPEED) rm = BEACON_SPEED;
+                }
+                break;
+
+            /* ---------------------------------------------------------- */
+            case STATE_BEACON_PAUSE:
+            /* Sit still for BEACON_PAUSE_MS. update_ldr() keeps running  */
+            /* at the top of the loop so the edge detector warms up.      */
+            /* ---------------------------------------------------------- */
+                lm = rm = 0;
+                if (milliseconds_now() - pause_start_ms >= BEACON_PAUSE_MS) {
+                    state = STATE_BEACON_STOP;
+                }
+                break;
+
+            /* ---------------------------------------------------------- */
+            case STATE_BEACON_STOP:
+            /* Take 10 samples, pick mode, save and print, then resume.   */
+            /* ---------------------------------------------------------- */
+                lm = rm = 0;
+                set_motors(0, 0);
+
+                beacon_freq_hz = sample_beacon_freq();
+
+                sprintf(buf, "BEACON FREQ: %u Hz\n", beacon_freq_hz);
+                serial0_print_string(buf);
+
+                state = STATE_FORWARD;
+                break;
+        }
+
+        set_motors(lm, rm);
+
+        sprintf(buf, "F:%3u L:%3u R:%3u | lm:%4d rm:%4d | st:%d | LDR:%uHz %uHz\n",
+                front, left, right, lm, rm, (int)state,
+                ldr_freq_hz[0], ldr_freq_hz[1]);
+        serial0_print_string(buf);
+    }
+
+    return 0;
+}
+
+/* ---- LDR edge detection ---- */
+
+void update_ldr(uint8_t idx, uint16_t adc_val, uint32_t now_ms)
+{
+    if (adc_val < ldr_min[idx]) {
+        ldr_min[idx] = adc_val;
+    } else if (ldr_min[idx] < adc_val && (now_ms % 10) == 0) {
+        ldr_min[idx]++;
+    }
+    if (adc_val > ldr_max[idx]) {
+        ldr_max[idx] = adc_val;
+    } else if (ldr_max[idx] > adc_val && (now_ms % 10) == 0) {
+        ldr_max[idx]--;
+    }
+
+    uint16_t range = ldr_max[idx] - ldr_min[idx];
+    if (range < 50) {
+        ldr_freq_hz[idx] = 0;
+        return;
+    }
+    uint16_t threshold = ldr_min[idx] + range / 3;
+
+    uint8_t new_state = (adc_val > threshold) ? 1 : 0;
+    if (new_state == ldr_state[idx]) return;
+
+    uint32_t gap = now_ms - ldr_last_edge[idx];
+    if (LDR_DEBOUNCE_MS > 0 && gap < LDR_DEBOUNCE_MS) return;
+
+    if (new_state == 1) {
+        if (ldr_last_rising[idx] > 0) {
+            uint32_t period = now_ms - ldr_last_rising[idx];
+            if (period >= BEACON_PERIOD_MIN && period <= BEACON_PERIOD_MAX) {
+                uint32_t diff = (uint32_t)labs((int32_t)period - (int32_t)ldr_period[idx]);
+                if (ldr_confirm[idx] == 0 || diff < (ldr_period[idx] / 3)) {
+                    ldr_period[idx] = period;
+                    ldr_confirm[idx]++;
+                    if (ldr_confirm[idx] >= FREQ_CONFIRM_COUNT) {
+                        ldr_freq_hz[idx] = (uint8_t)((1000 + ldr_period[idx]/2) / ldr_period[idx]);
+                        ldr_confirm[idx] = FREQ_CONFIRM_COUNT;
+                    }
+                } else {
+                    ldr_period[idx]  = period;
+                    ldr_confirm[idx] = 1;
+                }
+            } else {
+                ldr_confirm[idx] = 0;
+                ldr_freq_hz[idx] = 0;
+                ldr_period[idx]  = 0;
+            }
+        }
+        ldr_last_rising[idx] = now_ms;
+    }
+
+    ldr_last_edge[idx] = now_ms;
+    ldr_state[idx]     = new_state;
+}
+
+/* ---- distance helpers ---- */
+
+uint16_t read_front_cm(void)
+{
+    uint16_t raw = (adc_read(FRONT_PIN) + adc_read(FRONT_PIN) + adc_read(FRONT_PIN)) / 3;
+    if (raw <= 10) return 999;
+    int16_t cm = (int16_t)(((10650.08 / (raw - 14.57)) - 12.4) / 1.4);
+    if (cm < 0) return 999;
+    return (uint16_t)cm;
+}
+
+uint16_t read_right_cm(void)
+{
+    uint16_t raw = (adc_read(RIGHT_PIN) + adc_read(RIGHT_PIN) + adc_read(RIGHT_PIN)) / 3;
+    if (raw == 0) return 999;
+    int16_t cm = (int16_t)((2585 / raw) - 1);
+    if (cm < 0) return 999;
+    return (uint16_t)cm;
+}
+
+uint16_t read_left_cm(void)
+{
+    uint16_t raw = (adc_read(LEFT_PIN) + adc_read(LEFT_PIN) + adc_read(LEFT_PIN)) / 3;
+    if (raw == 0) return 999;
+    int16_t cm = (int16_t)((2585 / raw) - 1);
+    if (cm < 0) return 999;
+    return (uint16_t)cm;
+}
+
+/* ---- motor and GPIO setup ---- */
+
+void set_motors(int16_t lm, int16_t rm)
+{
+    OCR1A = (int32_t)abs(lm) * 9999 / 100;
+    OCR1B = (int32_t)abs(rm) * 9999 / 100;
+
+    if (lm >= 0) {
+        PORTA |=  (1 << PA0);
+        PORTA &= ~(1 << PA1);
+    } else {
+        PORTA &= ~(1 << PA0);
+        PORTA |=  (1 << PA1);
+    }
+
+    if (rm >= 0) {
+        PORTA |=  (1 << PA2);
+        PORTA &= ~(1 << PA3);
+    } else {
+        PORTA &= ~(1 << PA2);
+        PORTA |=  (1 << PA3);
+    }
+}
+
+void motor_pwm_init(void)
+{
+    TCCR1A = (1 << COM1A1) | (1 << COM1B1) | (1 << WGM11);
+    TCCR1B = (1 << WGM13)  | (1 << CS11);
+    ICR1   = 9999;
+    OCR1A  = 0;
+    OCR1B  = 0;
+}
+
+void GPIO_init(void)
+{
+    DDRA |= (1 << DDA0) | (1 << DDA1) | (1 << DDA2) | (1 << DDA3);
+    DDRB |= (1 << DDB0) | (1 << DDB5) | (1 << DDB6);
+    PORTB = 0;
+}
