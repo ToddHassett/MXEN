@@ -32,8 +32,8 @@
 #define WALL_AVOID_CM       7       /* hard-steer away when side wall ≤ this     */
 #define BASE_SPEED          60      /* normal forward speed                      */
 #define TURN_SPEED          60      /* spin speed during 90° turn                */
-#define TRACK_KP            5       /* P-gain for wall centering / following     */
-#define TURN_90_MS          1300     /* tune this until a 90° spin is achieved    */
+#define TRACK_KP            20       /* P-gain for wall centering / following     */
+#define TURN_90_MS          1250     /* tune this until a 90° spin is achieved    */
 
 #define LED_PIN             PB0
 
